@@ -158,7 +158,7 @@ async fn synthesize_local_guarded(text: &str) -> Result<(Vec<f32>, u32, CaptionT
         return match system_voice_line(text, "local voice still loading").await {
             Ok(v) => Ok(v),
             Err(why) => {
-                tracing::warn!("tts: Windows voice unavailable ({why}); waiting for the local voice");
+                tracing::warn!("tts: system voice unavailable ({why}); waiting for the local voice");
                 job.await.map_err(|e| format!("local voice join: {e}"))?
             }
         };
@@ -168,7 +168,7 @@ async fn synthesize_local_guarded(text: &str) -> Result<(Vec<f32>, u32, CaptionT
         Err(_late) => match system_voice_line(text, "local voice too slow").await {
             Ok(v) => Ok(v),
             Err(why) => {
-                tracing::warn!("tts: Windows voice unavailable ({why}); waiting for the local voice");
+                tracing::warn!("tts: system voice unavailable ({why}); waiting for the local voice");
                 job.await.map_err(|e| format!("local voice join: {e}"))?
             }
         },

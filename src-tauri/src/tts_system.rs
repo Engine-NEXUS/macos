@@ -88,8 +88,10 @@ fn synthesize_blocking(text: &str) -> Result<(Vec<f32>, u32), String> {
     let dir = std::env::temp_dir().join("nexus-say");
     let _ = std::fs::create_dir_all(&dir);
     let wav = dir.join(format!("line-{}.wav", std::process::id()));
+    // WAVE needs an explicit data format: without one `say` exits 1 with "Opening output file failed: fmt?".
+    // 16-bit little-endian PCM is what `decode_wav` reads.
     let res = std::process::Command::new("say")
-        .args(["--file-format=WAVE", "-o"])
+        .args(["--file-format=WAVE", "--data-format=LEI16@22050", "-o"])
         .arg(&wav)
         .arg(text)
         .output()
@@ -155,5 +157,15 @@ mod tests {
         assert!(samples.len() as u32 > rate / 5, "at least 0.2 s of audio");
         assert!(samples.iter().any(|s| s.abs() > 0.01), "not silence");
         assert!(ms < 3_000, "first call may be ~0.5 s, never seconds: {ms} ms");
+    }
+
+    /// `say` ships with every macOS install (CI runners included) and writes to a file, so no audio device is needed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_voice_renders_a_short_line() {
+        let (samples, rate) = synthesize_blocking("Ok sir.").expect("renders");
+        assert_eq!(rate, 22_050);
+        assert!(samples.len() as u32 > rate / 5, "at least 0.2 s of audio");
+        assert!(samples.iter().any(|s| s.abs() > 0.01), "not silence");
     }
 }
