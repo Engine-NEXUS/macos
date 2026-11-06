@@ -413,12 +413,18 @@ impl TileEnv for RealTileEnv {
 }
 
 /// Same rectangle within a few pixels (rounding at fractional DPI scales).
+#[cfg(any(target_os = "windows", test))]
 fn close_enough(want: Rect, got: Rect) -> bool {
-    const TOL: i32 = 3;
-    (want.left - got.left).abs() <= TOL
-        && (want.top - got.top).abs() <= TOL
-        && (want.right - got.right).abs() <= TOL
-        && (want.bottom - got.bottom).abs() <= TOL
+    near(want, got, 3)
+}
+
+/// Same rectangle within `tol` on every edge.
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
+pub(crate) fn near(want: Rect, got: Rect, tol: i32) -> bool {
+    (want.left - got.left).abs() <= tol
+        && (want.top - got.top).abs() <= tol
+        && (want.right - got.right).abs() <= tol
+        && (want.bottom - got.bottom).abs() <= tol
 }
 
 /// Turn the display off (it comes back on the next key press or mouse move). The message is sent with a
@@ -457,12 +463,12 @@ pub(crate) fn display_off() -> Result<(), String> {
 #[cfg(not(target_os = "windows"))]
 pub(crate) struct RealTileEnv;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub(crate) fn list_top_windows() -> Vec<TopWin> {
     Vec::new()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 impl TileEnv for RealTileEnv {
     fn work_area(&self) -> Option<Rect> {
         None
@@ -481,9 +487,626 @@ impl TileEnv for RealTileEnv {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub(crate) fn display_off() -> Result<(), String> {
     Err("unsupported on this platform".to_string())
+}
+
+// ─── macOS adapter ───────────────────────────────────────────────────
+//
+// Same contract as the Windows adapter, through the Accessibility API (needs the Accessibility permission; without it
+// the window list is empty and nothing moves). Geometry is in points, top-left origin, the space AXPosition/AXSize use,
+// so `columns` and `tile_windows` run unchanged. A window "handle" is a small number standing for an AXUIElement kept in
+// a process-wide table (`mac::handle_for`): macOS has no public window id that Accessibility can act on.
+//
+// Decisions are pure and tested on every OS (`flip_to_top_left`, `screens_top_left`, `screen_at`, `inner_rect`,
+// `rounded_rect`, `mac_app_considered`, `mac_window_considered`, `mac_title`, `front_first`); `mac` is the thin glue.
+
+/// A rectangle in points (macOS screen and Accessibility geometry): origin and size.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PtRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Cocoa (`NSScreen`) rectangles have their origin at the bottom-left of the primary screen with y growing upwards; the
+/// Accessibility API puts it at the top-left of the primary screen with y growing downwards. `primary_height` is the
+/// height of the primary screen (`NSScreen.screens[0]`, the one holding the menu bar origin), whichever screen `r` is on.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn flip_to_top_left(r: PtRect, primary_height: f64) -> PtRect {
+    PtRect { x: r.x, y: primary_height - (r.y + r.h), w: r.w, h: r.h }
+}
+
+/// One display in top-left points: its whole frame, and the part windows may use (menu bar and Dock excluded).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScreenFrames {
+    pub frame: PtRect,
+    pub visible: PtRect,
+}
+
+/// Convert every screen's Cocoa `(frame, visibleFrame)`, primary screen first (the order `NSScreen.screens` gives), to
+/// top-left points. Empty in, empty out.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn screens_top_left(cocoa: &[(PtRect, PtRect)]) -> Vec<ScreenFrames> {
+    let Some((primary, _)) = cocoa.first() else { return Vec::new() };
+    let ph = primary.h;
+    cocoa
+        .iter()
+        .map(|(f, v)| ScreenFrames { frame: flip_to_top_left(*f, ph), visible: flip_to_top_left(*v, ph) })
+        .collect()
+}
+
+/// The screen whose frame holds the point (left/top edges inside, right/bottom edges outside), first match wins.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn screen_at(screens: &[ScreenFrames], x: f64, y: f64) -> Option<usize> {
+    screens.iter().position(|s| {
+        let f = s.frame;
+        x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h
+    })
+}
+
+/// Snap a value that is an integer up to floating-point noise (Cocoa conversions give 24.999999 for 25).
+#[cfg(any(target_os = "macos", test))]
+fn snap(v: f64) -> f64 {
+    if (v - v.round()).abs() < 0.01 {
+        v.round()
+    } else {
+        v
+    }
+}
+
+/// Whole-point edges with every edge inside `p` (rounded inwards), so a window put there never slides under the menu bar
+/// or the Dock. None when `p` is not finite, does not fit an i32, or has no area left.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn inner_rect(p: PtRect) -> Option<Rect> {
+    edges(p, |l| l.ceil(), |r| r.floor())
+}
+
+/// Whole-point edges nearest to `p` (a frame read back from a window, for comparison).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn rounded_rect(p: PtRect) -> Option<Rect> {
+    edges(p, f64::round, f64::round)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn edges(p: PtRect, low: impl Fn(f64) -> f64, high: impl Fn(f64) -> f64) -> Option<Rect> {
+    let vals = [p.x, p.y, p.x + p.w, p.y + p.h];
+    if !vals.iter().all(|v| v.is_finite() && v.abs() < 1e9) {
+        return None;
+    }
+    let [l, t, r, b] = vals.map(snap);
+    let (left, top, right, bottom) = (low(l), low(t), high(r), high(b));
+    (right > left && bottom > top)
+        .then(|| Rect { left: left as i32, top: top as i32, right: right as i32, bottom: bottom as i32 })
+}
+
+/// A whole-point rectangle as points.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn pt_rect(r: Rect) -> PtRect {
+    PtRect { x: r.left as f64, y: r.top as f64, w: r.width() as f64, h: r.height() as f64 }
+}
+
+/// Whose windows the tiler looks at: ordinary Dock apps (activation policy "regular", so no menu-bar extras or
+/// background agents), not hidden with Cmd-H, never NEXUS itself.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn mac_app_considered(regular: bool, hidden: bool, pid: u32, own_pid: u32) -> bool {
+    regular && !hidden && pid != 0 && pid != own_pid
+}
+
+/// Which windows are tiled: standard app/document windows (not dialogs, sheets, floating panels or palettes) that are on
+/// screen (not minimised into the Dock) and not in full screen (such a window owns a Space of its own and cannot be
+/// moved).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn mac_window_considered(subrole: &str, minimized: bool, fullscreen: bool) -> bool {
+    subrole == "AXStandardWindow" && !minimized && !fullscreen
+}
+
+/// The title the resolver and `tileable` see: the window's own, or the app's name for an untitled window (so it is not
+/// dropped as "untitled" and can still be found by the app's name).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn mac_title(title: &str, app_name: &str) -> String {
+    let t = title.trim();
+    if t.is_empty() {
+        app_name.trim().to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// The front app's entries first, everything else in its original order (macOS lists apps by launch, not by depth, and
+/// the resolver takes the first match as the topmost).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn front_first<T>(items: Vec<T>, is_front: impl Fn(&T) -> bool) -> Vec<T> {
+    let (mut front, rest): (Vec<T>, Vec<T>) = items.into_iter().partition(|i| is_front(i));
+    front.extend(rest);
+    front
+}
+
+/// How far a placed window may end up from its column, in points. Terminals snap their size to whole character cells
+/// (up to a line height short); a window with a minimum size wider than the column misses by far more.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const MAC_FIT_TOL: i32 = 20;
+
+/// Every tileable window now, the front app's first (then in app launch order; within one app front to back).
+#[cfg(target_os = "macos")]
+pub(crate) fn list_top_windows() -> Vec<TopWin> {
+    mac::list_windows().into_iter().filter(tileable).collect()
+}
+
+#[cfg(target_os = "macos")]
+impl TileEnv for RealTileEnv {
+    /// Visible frame (menu bar and Dock excluded) of the main screen, the one with the key window.
+    fn work_area(&self) -> Option<Rect> {
+        let s = mac::screens()?;
+        inner_rect(s.list.get(s.main)?.visible)
+    }
+    fn exists(&self, hwnd: isize) -> bool {
+        mac::window_alive(hwnd)
+    }
+    /// No UAC on macOS: Accessibility either may move every window or none.
+    fn elevated(&self, _hwnd: isize) -> bool {
+        false
+    }
+    fn self_elevated(&self) -> bool {
+        false
+    }
+    fn place(&self, hwnd: isize, rect: Rect) -> PlaceResult {
+        mac::place(hwnd, rect)
+    }
+}
+
+/// Put the displays to sleep now (they wake on the next key press or mouse move), with `pmset displaysleepnow`: no
+/// admin rights needed. If the user's "require password after the screen saver begins or display is turned off" is set
+/// to immediately, macOS also locks the screen, which the Windows monitor-off does not. Callers must check
+/// `may_blank_display` first.
+#[cfg(target_os = "macos")]
+pub(crate) fn display_off() -> Result<(), String> {
+    let mut cmd = std::process::Command::new("/usr/bin/pmset");
+    cmd.arg("displaysleepnow");
+    crate::macos_foreground::run_capture(&mut cmd, std::time::Duration::from_secs(5))
+        .map(|_| ())
+        .ok_or_else(|| "pmset did not put the display to sleep".to_string())
+}
+
+/// The macOS glue: running apps and activation (`NSWorkspace` / `NSRunningApplication`), screen frames (`NSScreen`, on
+/// the main thread), and window geometry through the Accessibility helpers in `ax_mac::mac`. Also used by
+/// `live::commands::window` for focus, minimise and maximise.
+#[cfg(target_os = "macos")]
+pub(crate) mod mac {
+    use super::{PlaceResult, PtRect, Rect, ScreenFrames, TopWin};
+    use crate::ax_mac::mac::{self as ax, Owned, CGPoint, CGSize, AX_VALUE_CGPOINT, AX_VALUE_CGSIZE};
+    use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
+    use core_foundation_sys::base::{CFEqual, CFTypeRef};
+    use core_foundation_sys::string::CFStringRef;
+    use objc2::encode::{Encode, Encoding};
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use std::ffi::{c_char, c_void, CStr};
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::{mpsc, Mutex, Once};
+    use std::time::Duration;
+
+    // NSRect / NSPoint / NSSize are the CoreGraphics structs on 64-bit macOS; these carry the encodings `msg_send!`
+    // checks in debug builds.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct NsPoint {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct NsSize {
+        w: f64,
+        h: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct NsRect {
+        origin: NsPoint,
+        size: NsSize,
+    }
+    // SAFETY: the layouts above are exactly CGPoint {double x, y}, CGSize {double width, height} and CGRect {origin, size}.
+    unsafe impl Encode for NsPoint {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
+    unsafe impl Encode for NsSize {
+        const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+    }
+    unsafe impl Encode for NsRect {
+        const ENCODING: Encoding = Encoding::Struct("CGRect", &[NsPoint::ENCODING, NsSize::ENCODING]);
+    }
+
+    impl NsRect {
+        fn pt(self) -> PtRect {
+            PtRect { x: self.origin.x, y: self.origin.y, w: self.size.w, h: self.size.h }
+        }
+    }
+
+    /// The string inside an NSString, empty for nil.
+    ///
+    /// SAFETY: `s` is null or a live NSString, and the caller holds an autorelease pool.
+    unsafe fn ns_string(s: *mut AnyObject) -> String {
+        if s.is_null() {
+            return String::new();
+        }
+        let p: *const c_char = msg_send![s, UTF8String];
+        if p.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+
+    // ── apps ──
+
+    /// One running application, as `NSWorkspace` reports it.
+    #[derive(Debug, Clone)]
+    pub(crate) struct RunningApp {
+        pub pid: u32,
+        /// Display name, e.g. `Google Chrome`.
+        pub name: String,
+        /// Activation policy "regular": an ordinary app with a Dock icon (not a menu-bar extra or background agent).
+        pub regular: bool,
+        pub hidden: bool,
+    }
+
+    /// Every running application. Needs no permission.
+    pub(crate) fn running_apps() -> Vec<RunningApp> {
+        let Some(cls) = AnyClass::get(c"NSWorkspace") else { return Vec::new() };
+        objc2::rc::autoreleasepool(|_| {
+            // SAFETY: every receiver is checked for nil before it is messaged; selectors and types follow NSWorkspace.h
+            // and NSRunningApplication.h (pid_t, NSInteger, BOOL, NSString *).
+            unsafe {
+                let ws: *mut AnyObject = msg_send![cls, sharedWorkspace];
+                if ws.is_null() {
+                    return Vec::new();
+                }
+                let apps: *mut AnyObject = msg_send![ws, runningApplications];
+                if apps.is_null() {
+                    return Vec::new();
+                }
+                let n: usize = msg_send![apps, count];
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let a: *mut AnyObject = msg_send![apps, objectAtIndex: i];
+                    if a.is_null() {
+                        continue;
+                    }
+                    let pid: i32 = msg_send![a, processIdentifier];
+                    if pid <= 0 {
+                        continue;
+                    }
+                    let policy: isize = msg_send![a, activationPolicy];
+                    let hidden: bool = msg_send![a, isHidden];
+                    let name: *mut AnyObject = msg_send![a, localizedName];
+                    out.push(RunningApp { pid: pid as u32, name: ns_string(name), regular: policy == 0, hidden });
+                }
+                out
+            }
+        })
+    }
+
+    /// Ask macOS to bring the app with this pid to the front, un-hiding it first. Needs no permission (no Apple Events:
+    /// no Automation prompt). From macOS 14 a background app's request may be declined (cooperative activation); callers
+    /// fall back to the Accessibility `AXFrontmost` attribute.
+    pub(crate) fn activate_app(pid: u32) -> bool {
+        let Some(cls) = AnyClass::get(c"NSRunningApplication") else { return false };
+        objc2::rc::autoreleasepool(|_| {
+            // SAFETY: the app object is checked for nil; selectors and types follow NSRunningApplication.h.
+            unsafe {
+                let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid as i32];
+                if app.is_null() {
+                    return false;
+                }
+                let hidden: bool = msg_send![app, isHidden];
+                if hidden {
+                    let _: bool = msg_send![app, unhide];
+                }
+                // NSApplicationActivateIgnoringOtherApps (1 << 1); ignored from macOS 14 on, needed before it.
+                msg_send![app, activateWithOptions: 2usize]
+            }
+        })
+    }
+
+    // ── screens ──
+
+    /// Every display in top-left points, primary first, and which one is the main screen (the one with the key window).
+    pub(crate) struct Screens {
+        pub list: Vec<ScreenFrames>,
+        pub main: usize,
+    }
+
+    /// The displays now. None when AppKit does not answer (no window server, or the main thread is busy for over 1.5 s).
+    pub(crate) fn screens() -> Option<Screens> {
+        let (cocoa, main) = on_main(read_screens_cocoa, Duration::from_millis(1500)).flatten()?;
+        let list = super::screens_top_left(&cocoa);
+        if list.is_empty() {
+            return None;
+        }
+        let main = main.min(list.len() - 1);
+        Some(Screens { list, main })
+    }
+
+    /// `(frame, visibleFrame)` of every screen in Cocoa coordinates, primary first, and the index of the main screen.
+    /// AppKit declares NSScreen main-thread only: run through `on_main`.
+    fn read_screens_cocoa() -> Option<(Vec<(PtRect, PtRect)>, usize)> {
+        let cls = AnyClass::get(c"NSScreen")?;
+        objc2::rc::autoreleasepool(|_| {
+            // SAFETY: on the main thread (see `on_main`); every object is checked for nil before it is messaged.
+            unsafe {
+                let arr: *mut AnyObject = msg_send![cls, screens];
+                if arr.is_null() {
+                    return None;
+                }
+                let main: *mut AnyObject = msg_send![cls, mainScreen];
+                let n: usize = msg_send![arr, count];
+                let mut out = Vec::with_capacity(n);
+                let mut main_idx = 0;
+                for i in 0..n {
+                    let s: *mut AnyObject = msg_send![arr, objectAtIndex: i];
+                    if s.is_null() {
+                        continue;
+                    }
+                    if s == main {
+                        main_idx = out.len();
+                    }
+                    let f: NsRect = msg_send![s, frame];
+                    let v: NsRect = msg_send![s, visibleFrame];
+                    out.push((f.pt(), v.pt()));
+                }
+                (!out.is_empty()).then_some((out, main_idx))
+            }
+        })
+    }
+
+    /// Run `f` on the main thread and wait up to `wait` for its answer: directly when already there, otherwise queued on
+    /// the main dispatch queue (which the app's run loop drains). Never blocks the main thread on the caller, so it
+    /// cannot deadlock; a late answer is dropped. None on timeout or if `f` panicked.
+    ///
+    /// Test builds call `f` on the calling thread: libtest runs every test off the main thread and its main thread runs
+    /// no run loop, so a queued call would never be answered there.
+    fn on_main<T, F>(f: F, wait: Duration) -> Option<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        if cfg!(test) || objc2::MainThreadMarker::new().is_some() {
+            return Some(f());
+        }
+        // libdispatch is part of libSystem; `dispatch_get_main_queue()` is a macro for `&_dispatch_main_q`.
+        #[allow(non_upper_case_globals)]
+        extern "C" {
+            static _dispatch_main_q: u8;
+            fn dispatch_async_f(queue: *const u8, context: *mut c_void, work: extern "C" fn(*mut c_void));
+        }
+        extern "C" fn trampoline<T, F: FnOnce() -> T>(ctx: *mut c_void) {
+            // SAFETY: `ctx` is the box leaked below, handed to exactly one call of this function.
+            let job = unsafe { Box::from_raw(ctx as *mut (F, mpsc::SyncSender<T>)) };
+            let (f, tx) = *job;
+            if let Ok(v) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                let _ = tx.send(v);
+            }
+        }
+        let (tx, rx) = mpsc::sync_channel::<T>(1);
+        let ctx = Box::into_raw(Box::new((f, tx))) as *mut c_void;
+        // SAFETY: the main queue is a static that lives for the process; `trampoline` takes ownership of `ctx`.
+        unsafe { dispatch_async_f(std::ptr::addr_of!(_dispatch_main_q), ctx, trampoline::<T, F>) };
+        rx.recv_timeout(wait).ok()
+    }
+
+    // ── Accessibility ──
+
+    static TIMEOUT_SET: Once = Once::new();
+
+    /// The application element for `pid`, with the process-wide per-call limit set (a hung app must not stall the voice
+    /// pipeline for the 6 s system default; same 0.5 s as `ax_mac`).
+    pub(crate) fn app_element(pid: u32) -> Option<Owned> {
+        TIMEOUT_SET.call_once(|| {
+            // SAFETY: plain constructor (+1 reference, released by `Owned`) and a plain setter on it.
+            if let Some(sys) = Owned::new(unsafe { ax::AXUIElementCreateSystemWide() }) {
+                unsafe { ax::AXUIElementSetMessagingTimeout(sys.0, 0.5) };
+            }
+        });
+        // SAFETY: plain constructor; returns a +1 reference.
+        Owned::new(unsafe { ax::AXUIElementCreateApplication(pid as i32) })
+    }
+
+    /// The app's windows, front to back (the current Space's; minimised ones included).
+    pub(crate) fn windows_of(app: &Owned) -> Vec<Owned> {
+        // SAFETY: `children_of` checks the value is a CFArray before reading it.
+        ax::copy_attr(app, "AXWindows").map(|v| unsafe { ax::children_of(v.0) }).unwrap_or_default()
+    }
+
+    pub(crate) fn string_attr(el: &Owned, attr: &str) -> String {
+        // SAFETY: `string_of` checks the type.
+        ax::copy_attr(el, attr).map(|v| unsafe { ax::string_of(v.0) }).unwrap_or_default()
+    }
+
+    pub(crate) fn bool_attr(el: &Owned, attr: &str) -> Option<bool> {
+        // SAFETY: `bool_of` checks the type.
+        ax::copy_attr(el, attr).and_then(|v| unsafe { ax::bool_of(v.0) })
+    }
+
+    /// The window's frame in top-left points.
+    pub(crate) fn frame_of(w: &Owned) -> Option<PtRect> {
+        // SAFETY: `ax_value` checks the AXValue type before reading it.
+        let p: CGPoint = ax::copy_attr(w, "AXPosition").and_then(|v| unsafe { ax::ax_value(v.0, AX_VALUE_CGPOINT) })?;
+        let s: CGSize = ax::copy_attr(w, "AXSize").and_then(|v| unsafe { ax::ax_value(v.0, AX_VALUE_CGSIZE) })?;
+        Some(PtRect { x: p.x, y: p.y, w: s.w, h: s.h })
+    }
+
+    fn set_value(el: &Owned, attr: &str, kind: u32, value: *const c_void) -> bool {
+        // SAFETY: `value` points at a live CGPoint/CGSize matching `kind`; AXValueCreate copies it (+1 reference).
+        let Some(v) = Owned::new(unsafe { ax::AXValueCreate(kind, value) }) else { return false };
+        let name = ax::cf_string(attr);
+        // SAFETY: `el` is a live AXUIElement, `name` a CFString and `v` an AXValue.
+        unsafe { ax::AXUIElementSetAttributeValue(el.0, name.0 as CFStringRef, v.0 as CFTypeRef) == 0 }
+    }
+
+    /// Move the window to `r` (top-left points), size it, then move it again: moving first keeps a growing window from
+    /// being pushed back by the screen edge, and some apps shift the window while they resize. True when macOS accepted
+    /// the move or the resize; callers read the frame back to see what the app really did.
+    pub(crate) fn set_frame(w: &Owned, r: PtRect) -> bool {
+        let p = CGPoint { x: r.x, y: r.y };
+        let s = CGSize { w: r.w, h: r.h };
+        let pp = &p as *const CGPoint as *const c_void;
+        let moved = set_value(w, "AXPosition", AX_VALUE_CGPOINT, pp);
+        let sized = set_value(w, "AXSize", AX_VALUE_CGSIZE, &s as *const CGSize as *const c_void);
+        let _ = set_value(w, "AXPosition", AX_VALUE_CGPOINT, pp);
+        moved || sized
+    }
+
+    pub(crate) fn perform(el: &Owned, action: &str) -> bool {
+        let name = ax::cf_string(action);
+        // SAFETY: `el` is a live AXUIElement and `name` a CFString.
+        unsafe { ax::AXUIElementPerformAction(el.0, name.0 as CFStringRef) == 0 }
+    }
+
+    /// Several attributes of one element in a single cross-process call, one entry per name (None where missing).
+    fn read_attrs(el: &Owned, names: &ax::Names) -> Option<Vec<Option<Owned>>> {
+        let mut values: CFArrayRef = std::ptr::null();
+        // SAFETY: `el` is a live AXUIElement and `names.array` a CFArray of CFStrings; `values` receives a +1 array.
+        let err = unsafe { ax::AXUIElementCopyMultipleAttributeValues(el.0, names.array.0 as CFArrayRef, 0, &mut values) };
+        if err != 0 {
+            return None;
+        }
+        let values = Owned::new(values as CFTypeRef)?;
+        let arr = values.0 as CFArrayRef;
+        // SAFETY: indices stay below the count; each entry is retained before `values` is released.
+        let n = unsafe { CFArrayGetCount(arr) };
+        Some((0..n).map(|i| Owned::retain(unsafe { CFArrayGetValueAtIndex(arr, i) })).collect())
+    }
+
+    // ── window handles ──
+
+    /// A window element kept for a handle.
+    struct Kept {
+        id: isize,
+        el: Owned,
+    }
+    // SAFETY: an AXUIElementRef is an immutable CF object; retain/release are thread-safe and Accessibility calls may be
+    // made with it from any thread.
+    unsafe impl Send for Kept {}
+
+    static KEPT: Mutex<Vec<Kept>> = Mutex::new(Vec::new());
+    static NEXT_ID: AtomicIsize = AtomicIsize::new(1);
+    /// Handles remembered at once; the oldest are forgotten first (a forgotten handle reads as a closed window).
+    const KEEP_MAX: usize = 256;
+
+    /// The handle of a window element: the same window always gets the same handle (CFEqual), a new one the next
+    /// number. 0 only when the table cannot be used.
+    fn handle_for(el: &Owned) -> isize {
+        let Ok(mut kept) = KEPT.lock() else { return 0 };
+        // SAFETY: both are live CF objects; CFEqual on two AXUIElements compares them locally.
+        if let Some(k) = kept.iter().find(|k| unsafe { CFEqual(k.el.0, el.0) } != 0) {
+            return k.id;
+        }
+        let Some(el) = Owned::retain(el.0) else { return 0 };
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        kept.push(Kept { id, el });
+        if kept.len() > KEEP_MAX {
+            let extra = kept.len() - KEEP_MAX;
+            kept.drain(..extra);
+        }
+        id
+    }
+
+    fn window_for(id: isize) -> Option<Owned> {
+        let kept = KEPT.lock().ok()?;
+        Owned::retain(kept.iter().find(|k| k.id == id)?.el.0)
+    }
+
+    /// True while the window behind the handle still answers.
+    pub(crate) fn window_alive(id: isize) -> bool {
+        window_for(id).is_some_and(|w| ax::copy_attr(&w, "AXRole").is_some())
+    }
+
+    /// Test helper: the frame of the window behind a handle, in whole points.
+    #[cfg(test)]
+    pub(crate) fn frame_by_handle(id: isize) -> Option<Rect> {
+        window_for(id).and_then(|w| frame_of(&w)).and_then(super::rounded_rect)
+    }
+
+    // ── the adapter ──
+
+    /// Every standard, on-screen window of the ordinary apps (see `mac_app_considered` / `mac_window_considered`), the
+    /// front app's first. Empty without the Accessibility permission.
+    pub(crate) fn list_windows() -> Vec<TopWin> {
+        if !ax::trusted() {
+            tracing::warn!("[TILE] Accessibility permission missing: no windows to list");
+            return Vec::new();
+        }
+        let own = std::process::id();
+        let front = crate::macos_foreground::front_app().map(|f| f.pid);
+        let apps: Vec<RunningApp> = running_apps()
+            .into_iter()
+            .filter(|a| super::mac_app_considered(a.regular, a.hidden, a.pid, own))
+            .collect();
+        let apps = super::front_first(apps, |a| Some(a.pid) == front);
+        let names = ax::names(&["AXSubrole", "AXTitle", "AXMinimized", "AXFullScreen"]);
+        let mut out = Vec::new();
+        for app in &apps {
+            let Some(el) = app_element(app.pid) else { continue };
+            for w in windows_of(&el) {
+                let Some(v) = read_attrs(&w, &names) else { continue };
+                let get = |i: usize| v.get(i).and_then(|o| o.as_ref()).map(|o| o.0).unwrap_or(std::ptr::null());
+                // SAFETY: the readers check each value's CF type; the values live while `v` is held.
+                let (subrole, title, minimized, fullscreen) = unsafe {
+                    (
+                        ax::string_of(get(0)),
+                        ax::string_of(get(1)),
+                        ax::bool_of(get(2)).unwrap_or(false),
+                        ax::bool_of(get(3)).unwrap_or(false),
+                    )
+                };
+                if !super::mac_window_considered(&subrole, minimized, fullscreen) {
+                    continue;
+                }
+                let hwnd = handle_for(&w);
+                if hwnd == 0 {
+                    continue;
+                }
+                out.push(TopWin {
+                    hwnd,
+                    pid: app.pid,
+                    exe: app.name.to_lowercase(),
+                    class: subrole,
+                    title: super::mac_title(&title, &app.name),
+                });
+            }
+        }
+        out
+    }
+
+    /// Put one window exactly on `rect` (top-left points), restoring it from the Dock first.
+    pub(crate) fn place(hwnd: isize, rect: Rect) -> PlaceResult {
+        let Some(w) = window_for(hwnd) else { return PlaceResult::SkippedGone };
+        if ax::copy_attr(&w, "AXRole").is_none() {
+            return PlaceResult::SkippedGone;
+        }
+        if bool_attr(&w, "AXFullScreen") == Some(true) {
+            return PlaceResult::Failed("the window is in full screen".to_string());
+        }
+        if bool_attr(&w, "AXMinimized") == Some(true) {
+            ax::set_bool(&w, "AXMinimized", false);
+            // the window animates out of the Dock first; a move during that animation is lost
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        if !set_frame(&w, super::pt_rect(rect)) {
+            return PlaceResult::Failed("macOS refused to move the window".to_string());
+        }
+        match frame_of(&w).and_then(super::rounded_rect) {
+            Some(got) if !super::near(rect, got, super::MAC_FIT_TOL) => {
+                PlaceResult::Failed("the window would not fit the column (minimum size?)".to_string())
+            }
+            _ => PlaceResult::Placed,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -831,6 +1454,178 @@ mod tests {
     fn close_enough_tolerates_rounding_only() {
         assert!(close_enough(r(0, 0, 100, 100), r(1, -2, 102, 99)));
         assert!(!close_enough(r(0, 0, 100, 100), r(0, 0, 140, 100)));
+    }
+
+    // ── macOS geometry and filters (pure; run on every OS) ──
+
+    fn pt(x: f64, y: f64, w: f64, h: f64) -> PtRect {
+        PtRect { x, y, w, h }
+    }
+
+    #[test]
+    fn near_uses_the_given_tolerance_on_every_edge() {
+        assert!(near(r(0, 25, 720, 900), r(0, 25, 720, 900), 0));
+        assert!(near(r(0, 25, 720, 900), r(0, 25, 714, 884), MAC_FIT_TOL), "a terminal snapped to its character grid");
+        assert!(!near(r(0, 25, 720, 900), r(0, 25, 800, 900), MAC_FIT_TOL), "a minimum width wider than the column");
+        assert!(!near(r(0, 25, 720, 900), r(0, 60, 720, 900), MAC_FIT_TOL));
+    }
+
+    #[test]
+    fn cocoa_rects_flip_to_top_left_points() {
+        // MacBook: 1512x982 screen, 33 pt menu bar, 60 pt Dock at the bottom
+        let ph = 982.0;
+        let frame = pt(0.0, 0.0, 1512.0, 982.0);
+        let visible = pt(0.0, 60.0, 1512.0, 889.0); // Cocoa: starts above the Dock, ends under the menu bar
+        assert_eq!(flip_to_top_left(frame, ph), frame);
+        assert_eq!(flip_to_top_left(visible, ph), pt(0.0, 33.0, 1512.0, 889.0));
+        // a second display above the primary one: negative top in AX space
+        assert_eq!(flip_to_top_left(pt(0.0, 982.0, 1920.0, 1080.0), ph), pt(0.0, -1080.0, 1920.0, 1080.0));
+        // and one to the left, bottom-aligned
+        assert_eq!(flip_to_top_left(pt(-1920.0, 0.0, 1920.0, 1080.0), ph), pt(-1920.0, -98.0, 1920.0, 1080.0));
+        // flipping twice is the identity
+        let x = pt(12.0, 34.0, 56.0, 78.0);
+        assert_eq!(flip_to_top_left(flip_to_top_left(x, ph), ph), x);
+    }
+
+    #[test]
+    fn every_screen_converts_against_the_primary_height() {
+        let cocoa = vec![
+            (pt(0.0, 0.0, 1512.0, 982.0), pt(0.0, 60.0, 1512.0, 889.0)),
+            // external display on the right, taller, with its own menu bar (24 pt) and no Dock
+            (pt(1512.0, -200.0, 2560.0, 1440.0), pt(1512.0, -200.0, 2560.0, 1416.0)),
+        ];
+        let s = screens_top_left(&cocoa);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].visible, pt(0.0, 33.0, 1512.0, 889.0));
+        // top edge: 982 - (-200 + 1440) = -258; the visible part starts under its own menu bar
+        assert_eq!(s[1].frame, pt(1512.0, -258.0, 2560.0, 1440.0));
+        assert_eq!(s[1].visible, pt(1512.0, -234.0, 2560.0, 1416.0));
+        assert!(screens_top_left(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_screen_under_a_point_is_found_and_edges_belong_to_one_screen() {
+        let s = screens_top_left(&[
+            (pt(0.0, 0.0, 1512.0, 982.0), pt(0.0, 60.0, 1512.0, 889.0)),
+            (pt(1512.0, 0.0, 1920.0, 1080.0), pt(1512.0, 0.0, 1920.0, 1055.0)),
+        ]);
+        assert_eq!(screen_at(&s, 700.0, 400.0), Some(0));
+        assert_eq!(screen_at(&s, 2000.0, 100.0), Some(1));
+        assert_eq!(screen_at(&s, 1512.0, 100.0), Some(1), "the shared edge is the right screen's left edge");
+        assert_eq!(screen_at(&s, 0.0, 0.0), Some(0));
+        assert_eq!(screen_at(&s, -5.0, 100.0), None);
+        assert_eq!(screen_at(&s, 700.0, 5000.0), None);
+        assert_eq!(screen_at(&[], 1.0, 1.0), None);
+    }
+
+    #[test]
+    fn inner_rect_rounds_inwards_and_rejects_nonsense() {
+        assert_eq!(inner_rect(pt(0.0, 33.0, 1512.0, 889.0)), Some(r(0, 33, 1512, 922)));
+        // fractional edges move inwards, never under the menu bar or the Dock
+        assert_eq!(inner_rect(pt(0.5, 24.5, 100.0, 100.0)), Some(r(1, 25, 100, 124)));
+        // floating-point noise from the conversion is not a fraction
+        assert_eq!(inner_rect(pt(-0.000001, 24.999999, 1440.000001, 875.0)), Some(r(0, 25, 1440, 900)));
+        assert_eq!(inner_rect(pt(0.0, 0.0, 0.0, 100.0)), None);
+        assert_eq!(inner_rect(pt(0.2, 0.0, 0.5, 100.0)), None, "nothing whole is left");
+        assert_eq!(inner_rect(pt(f64::NAN, 0.0, 10.0, 10.0)), None);
+        assert_eq!(inner_rect(pt(0.0, 0.0, f64::INFINITY, 10.0)), None);
+        assert_eq!(inner_rect(pt(1e12, 0.0, 10.0, 10.0)), None, "does not fit an i32");
+        // negative origins (displays left of / above the primary)
+        assert_eq!(inner_rect(pt(-1920.0, -258.0, 1920.0, 1080.0)), Some(r(-1920, -258, 0, 822)));
+    }
+
+    #[test]
+    fn rounded_rect_takes_the_nearest_edges_and_round_trips_through_points() {
+        assert_eq!(rounded_rect(pt(0.4, 24.6, 100.2, 100.0)), Some(r(0, 25, 101, 125)));
+        let col = r(504, 33, 1008, 922);
+        assert_eq!(rounded_rect(pt_rect(col)), Some(col));
+        assert_eq!(inner_rect(pt_rect(col)), Some(col));
+        assert_eq!(pt_rect(col), pt(504.0, 33.0, 504.0, 889.0));
+    }
+
+    #[test]
+    fn the_columns_of_a_mac_visible_frame_fill_it() {
+        let work = inner_rect(pt(0.0, 33.0, 1512.0, 889.0)).unwrap();
+        for n in 1..=6 {
+            check_tiling(work, n);
+        }
+    }
+
+    #[test]
+    fn only_ordinary_visible_apps_other_than_nexus_are_considered() {
+        let own = 4242;
+        assert!(mac_app_considered(true, false, 100, own));
+        assert!(!mac_app_considered(false, false, 100, own), "menu-bar extras and background agents");
+        assert!(!mac_app_considered(true, true, 100, own), "hidden with Cmd-H");
+        assert!(!mac_app_considered(true, false, own, own), "never NEXUS itself");
+        assert!(!mac_app_considered(true, false, 0, own));
+    }
+
+    #[test]
+    fn only_standard_on_screen_windows_are_tiled() {
+        assert!(mac_window_considered("AXStandardWindow", false, false));
+        assert!(!mac_window_considered("AXStandardWindow", true, false), "minimised into the Dock");
+        assert!(!mac_window_considered("AXStandardWindow", false, true), "full screen owns its own Space");
+        for sub in ["AXDialog", "AXSystemDialog", "AXFloatingWindow", "AXSystemFloatingWindow", "AXUnknown", ""] {
+            assert!(!mac_window_considered(sub, false, false), "{sub:?}");
+        }
+    }
+
+    #[test]
+    fn an_untitled_window_takes_its_apps_name_and_stays_tileable() {
+        assert_eq!(mac_title("main.rs — NEXUS", "Code"), "main.rs — NEXUS");
+        assert_eq!(mac_title("  ", "Antigravity"), "Antigravity");
+        assert_eq!(mac_title("", ""), "");
+        let w = tw(1, 10, "antigravity", "AXStandardWindow", &mac_title("", "Antigravity"));
+        assert!(tileable(&w));
+        assert_eq!(find_agent_window(&spec(&["antigravity"], &[]), &[w]), Some(1));
+    }
+
+    #[test]
+    fn the_front_apps_windows_come_first_and_the_rest_keep_their_order() {
+        let apps = vec![(1, "a"), (2, "b"), (3, "c"), (2, "b2")];
+        let out = front_first(apps, |a| a.0 == 2);
+        assert_eq!(out, vec![(2, "b"), (2, "b2"), (1, "a"), (3, "c")]);
+        assert_eq!(front_first(vec![1, 2, 3], |_| false), vec![1, 2, 3], "no front app: unchanged");
+        assert!(front_first(Vec::<u8>::new(), |_| true).is_empty());
+    }
+
+    /// Live, on this Mac: lists the screens and the tileable windows, tiles the first two into columns, checks they
+    /// landed, then puts both back where they were. Moves real windows for a moment. Needs the Accessibility permission
+    /// for the terminal and at least two ordinary, non-full-screen windows on the current Space:
+    ///   cargo test --lib window_tile::tests::live_mac_tiles_two_windows_and_puts_them_back -- --ignored --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "moves two real windows on this Mac and back; needs Accessibility; run by hand"]
+    fn live_mac_tiles_two_windows_and_puts_them_back() {
+        assert!(crate::ax_mac::trusted(), "grant Accessibility to the terminal first");
+        let screens = mac::screens().expect("NSScreen answers");
+        for (i, s) in screens.list.iter().enumerate() {
+            println!("[PROOF] screen {i}{}: frame {:?} visible {:?}", if i == screens.main { " (main)" } else { "" }, s.frame, s.visible);
+        }
+        let work = RealTileEnv.work_area().expect("a work area");
+        println!("[PROOF] work area {work:?}");
+        let wins = list_top_windows();
+        for w in &wins {
+            println!("[PROOF] window {} pid {} {:?} {:?}", w.hwnd, w.pid, w.exe, w.title);
+        }
+        assert!(wins.len() >= 2, "open at least two ordinary windows first");
+        let pick: Vec<isize> = wins.iter().take(2).map(|w| w.hwnd).collect();
+        let before: Vec<Option<Rect>> = pick.iter().map(|h| mac::frame_by_handle(*h)).collect();
+        let results = tile_windows(&RealTileEnv, &pick);
+        let after: Vec<Option<Rect>> = pick.iter().map(|h| mac::frame_by_handle(*h)).collect();
+        for (i, h) in pick.iter().enumerate() {
+            if let Some(b) = before[i] {
+                let _ = mac::place(*h, b);
+            }
+        }
+        println!("[PROOF] results {results:?} frames {after:?} (restored to {before:?})");
+        let cols = columns(work, 2);
+        for (i, (h, res)) in results.iter().enumerate() {
+            assert_eq!(*res, PlaceResult::Placed, "window {h}");
+            let got = after[i].expect("frame readable");
+            assert!(near(cols[i], got, MAC_FIT_TOL), "window {h}: wanted {:?}, got {got:?}", cols[i]);
+        }
     }
 
     // ── dev: tile two Notepad windows (run by hand; blanks nothing) ──

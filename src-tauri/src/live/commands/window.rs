@@ -271,43 +271,29 @@ mod windows_impl {
 
 #[cfg(all(not(target_os = "windows"), target_os = "macos"))]
 mod unix_impl {
+    //! macOS: the Accessibility API (move, minimise, raise) and `NSRunningApplication` (activate), through
+    //! `ax_mac::mac` and `window_tile::mac`. No AppleScript, so no Automation prompt; minimise, maximise and title
+    //! matching need the Accessibility permission and report `false` without it.
+
+    use crate::ax_mac::mac::{self as ax, Owned};
+    use crate::window_tile::mac as wm;
     use std::time::{Duration, Instant};
 
-    /// System Events is the only no-objc path for frontmost app/AX actions.
-    /// First use raises the one-time Accessibility permission prompt; a
-    /// refusal surfaces as Err and callers degrade to a spoken "I couldn't".
-    fn run_osa(script: &str) -> Result<String, String> {
-        let out = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .output()
-            .map_err(|e| format!("osascript: {e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
-    }
-
-    /// "{AppName, WindowTitle}" comma list → "AppName WindowTitle".
+    /// "AppName WindowTitle" of the app in front, or the app name alone when its window has no title or Accessibility
+    /// is off. NEXUS's own window is named by the app only (asking our own process through Accessibility from here
+    /// could wait on our own main thread).
     fn foreground_identity() -> Option<String> {
-        let out = run_osa(
-            r#"tell application "System Events"
-                set p to first application process whose frontmost is true
-                if exists window 1 of p then
-                    return {name of p, name of window 1 of p}
-                end if
-                return name of p
-            end tell"#,
-        )
-        .ok()?;
-        let combined = out.split(',').map(|p| p.trim()).collect::<Vec<_>>().join(" ");
-        let combined = combined.trim().to_string();
-        if combined.is_empty() {
-            None
+        let front = crate::macos_foreground::front_app()?;
+        let title = if front.pid != std::process::id() && ax::trusted() {
+            wm::app_element(front.pid)
+                .and_then(|app| ax::copy_attr(&app, "AXFocusedWindow").or_else(|| ax::copy_attr(&app, "AXMainWindow")))
+                .map(|w| wm::string_attr(&w, "AXTitle"))
+                .unwrap_or_default()
         } else {
-            Some(combined)
-        }
+            String::new()
+        };
+        let line = super::identity_line(&front.name, &title);
+        (!line.is_empty()).then_some(line)
     }
 
     pub fn get_foreground_window_title() -> Option<String> {
@@ -321,16 +307,83 @@ mod unix_impl {
             .is_some_and(|t| t.contains(&want))
     }
 
+    /// Bring an app to the front by its name ("chrome" finds Google Chrome), else the window whose title contains
+    /// `partial_title`. Un-hides and un-minimises it. True once that app is really in front.
     pub fn focus_app_by_title(partial_title: &str) -> bool {
-        let app = partial_title.trim();
-        if app.is_empty() {
+        let want = partial_title.trim();
+        if want.is_empty() {
             return false;
         }
-        let app = app.replace('"', "'");
-        let script = format!(
-            "tell application \"System Events\" to set frontmost of (first application process whose name contains \"{app}\") to true"
-        );
-        run_osa(&script).is_ok()
+        let own = std::process::id();
+        let apps: Vec<wm::RunningApp> = wm::running_apps().into_iter().filter(|a| a.regular && a.pid != own).collect();
+        let names: Vec<(u32, &str)> = apps.iter().map(|a| (a.pid, a.name.as_str())).collect();
+        if let Some(pid) = super::pick_app(&names, want) {
+            return bring_to_front(pid, None);
+        }
+        // No app by that name: a window that says it in its title (a document, a browser tab).
+        if !ax::trusted() {
+            tracing::warn!("[WINDOW] no app called {want:?}; window titles need the Accessibility permission");
+            return false;
+        }
+        for a in &apps {
+            let Some(el) = wm::app_element(a.pid) else { continue };
+            for w in wm::windows_of(&el) {
+                if super::title_has(&wm::string_attr(&w, "AXTitle"), want) {
+                    return bring_to_front(a.pid, Some(w));
+                }
+            }
+        }
+        false
+    }
+
+    /// Activate the app and raise `window` (else its main window). macOS 14+ may decline a background app's activation
+    /// request; the Accessibility `AXFrontmost` attribute is the fallback.
+    fn bring_to_front(pid: u32, window: Option<Owned>) -> bool {
+        let app = if ax::trusted() { wm::app_element(pid) } else { None };
+        let window = window.or_else(|| {
+            let a = app.as_ref()?;
+            ax::copy_attr(a, "AXMainWindow")
+                .or_else(|| ax::copy_attr(a, "AXFocusedWindow"))
+                .or_else(|| wm::windows_of(a).into_iter().next())
+        });
+        if let Some(w) = &window {
+            if wm::bool_attr(w, "AXMinimized") == Some(true) {
+                ax::set_bool(w, "AXMinimized", false);
+            }
+        }
+        let asked = wm::activate_app(pid);
+        let raise = || {
+            if let Some(w) = &window {
+                wm::perform(w, "AXRaise");
+                ax::set_bool(w, "AXMain", true);
+            }
+        };
+        raise();
+        if wait_front(pid, Duration::from_millis(400)) {
+            return true;
+        }
+        if let Some(a) = &app {
+            ax::set_bool(a, "AXFrontmost", true);
+            raise();
+        }
+        let ok = wait_front(pid, Duration::from_millis(600));
+        if !ok {
+            tracing::warn!("[WINDOW] pid {pid} did not come to the front (activation asked: {asked})");
+        }
+        ok
+    }
+
+    fn wait_front(pid: u32, limit: Duration) -> bool {
+        let t0 = Instant::now();
+        loop {
+            if crate::macos_foreground::front_app().is_some_and(|f| f.pid == pid) {
+                return true;
+            }
+            if t0.elapsed() >= limit {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
     }
 
     pub fn wait_and_focus_app(partial_title: &str, timeout_ms: u64) -> bool {
@@ -348,18 +401,60 @@ mod unix_impl {
         }
     }
 
-    pub fn minimize_foreground_window() -> bool {
-        run_osa(
-            "tell application \"System Events\" to perform action \"AXMinimize\" of window 1 of (first application process whose frontmost is true)",
-        )
-        .is_ok()
+    /// The focused window of the app in front (never NEXUS's own), or None with the reason logged.
+    fn front_window() -> Option<Owned> {
+        match ax::front_window() {
+            Ok((_front, _app, window)) => Some(window),
+            Err(why) => {
+                tracing::warn!("[WINDOW] no front window to act on: {why}");
+                None
+            }
+        }
     }
 
+    /// Minimise the front window into the Dock. True when macOS took it (or it already was).
+    pub fn minimize_foreground_window() -> bool {
+        let Some(w) = front_window() else { return false };
+        if wm::bool_attr(&w, "AXMinimized") == Some(true) || ax::set_bool(&w, "AXMinimized", true) {
+            return true;
+        }
+        // A window that refuses the attribute may still have the yellow button.
+        ax::copy_attr(&w, "AXMinimizeButton").is_some_and(|b| wm::perform(&b, "AXPress"))
+    }
+
+    /// "Maximise" on a Mac: fill the visible frame (menu bar and Dock excluded) of the screen the window is on. Not the
+    /// green button's full screen, which moves the window to a Space of its own. True when macOS accepted the new frame
+    /// (same "a window was acted on" meaning as the Windows `SW_MAXIMIZE`); a window with a maximum size stays smaller.
     pub fn maximize_foreground_window() -> bool {
-        run_osa(
-            "tell application \"System Events\" to perform action \"AXZoomWindow\" of window 1 of (first application process whose frontmost is true)",
-        )
-        .is_ok()
+        let Some(w) = front_window() else { return false };
+        if wm::bool_attr(&w, "AXFullScreen") == Some(true) {
+            return true;
+        }
+        if wm::bool_attr(&w, "AXMinimized") == Some(true) {
+            ax::set_bool(&w, "AXMinimized", false);
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        let Some(screens) = wm::screens() else {
+            tracing::warn!("[WINDOW] maximise: the screen frames could not be read");
+            return false;
+        };
+        let current = wm::frame_of(&w);
+        let idx = current
+            .and_then(|f| crate::window_tile::screen_at(&screens.list, f.x + f.w / 2.0, f.y + f.h / 2.0))
+            .unwrap_or(screens.main);
+        let Some(target) = screens.list.get(idx).and_then(|s| crate::window_tile::inner_rect(s.visible)) else {
+            return false;
+        };
+        if !wm::set_frame(&w, crate::window_tile::pt_rect(target)) {
+            tracing::warn!("[WINDOW] maximise: macOS refused to move or resize the window");
+            return false;
+        }
+        if let Some(got) = wm::frame_of(&w).and_then(crate::window_tile::rounded_rect) {
+            if !crate::window_tile::near(target, got, crate::window_tile::MAC_FIT_TOL) {
+                tracing::info!("[WINDOW] maximise: wanted {target:?}, the app kept {got:?} (size limits?)");
+            }
+        }
+        true
     }
 
     /// No UAC/UIPI concept — never elevated-blocked.
@@ -370,6 +465,59 @@ mod unix_impl {
     /// No UAC/UIPI concept — never elevated-blocked.
     pub fn window_process_elevated(_hwnd: ()) -> bool {
         false
+    }
+}
+
+/// Lower-case, trimmed, without a trailing ".app" (people and NLU slots sometimes say "Notes.app").
+#[cfg(any(target_os = "macos", test))]
+fn norm_app(s: &str) -> String {
+    let s = s.trim().to_lowercase();
+    s.strip_suffix(".app").map(str::trim_end).unwrap_or(&s).to_string()
+}
+
+/// The running app a spoken name means, by display name: an exact name first, then a name starting with it, then a
+/// name containing it ("chrome" finds Google Chrome). Ties go to the earliest in `apps`. None for an empty name.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn pick_app(apps: &[(u32, &str)], spoken: &str) -> Option<u32> {
+    let want = norm_app(spoken);
+    if want.is_empty() {
+        return None;
+    }
+    let rank = |name: &str| {
+        let n = norm_app(name);
+        if n.is_empty() {
+            None
+        } else if n == want {
+            Some(0)
+        } else if n.starts_with(&want) {
+            Some(1)
+        } else if n.contains(&want) {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    apps.iter().filter_map(|(pid, name)| rank(name).map(|r| (r, *pid))).min_by_key(|(r, _)| *r).map(|(_, pid)| pid)
+}
+
+/// Case-insensitive "the title contains it", never for an empty search.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn title_has(title: &str, spoken: &str) -> bool {
+    let want = spoken.trim().to_lowercase();
+    !want.is_empty() && title.to_lowercase().contains(&want)
+}
+
+/// "AppName WindowTitle", the shape callers match agent and app names against; the app name alone when there is no
+/// title, and no doubled name when the title is just the app's name.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn identity_line(app: &str, title: &str) -> String {
+    let (a, t) = (app.trim(), title.trim());
+    if t.is_empty() || t.eq_ignore_ascii_case(a) {
+        a.to_string()
+    } else if a.is_empty() {
+        t.to_string()
+    } else {
+        format!("{a} {t}")
     }
 }
 
@@ -440,5 +588,64 @@ mod tests {
     fn test_own_elevation_check_runs() {
         // Must never panic; value depends on how the test runner launched.
         let _ = super::our_process_elevated();
+    }
+
+    // ── macOS name matching (pure; run on every OS) ──
+
+    use super::{identity_line, pick_app, title_has};
+
+    const APPS: &[(u32, &str)] = &[
+        (10, "Finder"),
+        (20, "Google Chrome"),
+        (30, "Safari Technology Preview"),
+        (40, "Safari"),
+        (50, "Code"),
+        (60, "WhatsApp"),
+        (70, "Notes"),
+    ];
+
+    #[test]
+    fn window_spoken_app_name_finds_the_running_app() {
+        assert_eq!(pick_app(APPS, "WhatsApp"), Some(60));
+        assert_eq!(pick_app(APPS, "  whatsapp "), Some(60), "case and spaces do not matter");
+        assert_eq!(pick_app(APPS, "chrome"), Some(20), "part of the name");
+        assert_eq!(pick_app(APPS, "google"), Some(20), "start of the name");
+        assert_eq!(pick_app(APPS, "Notes.app"), Some(70), "a trailing .app is ignored");
+    }
+
+    #[test]
+    fn window_exact_name_beats_a_longer_name_listed_earlier() {
+        assert_eq!(pick_app(APPS, "safari"), Some(40));
+        assert_eq!(pick_app(APPS, "safari tech"), Some(30));
+        // equal rank: the first listed wins
+        assert_eq!(pick_app(&[(1, "Code Helper Tool"), (2, "Code Runner")], "code"), Some(1));
+    }
+
+    #[test]
+    fn window_unknown_or_empty_names_find_nothing() {
+        assert_eq!(pick_app(APPS, "spotify"), None);
+        assert_eq!(pick_app(APPS, ""), None);
+        assert_eq!(pick_app(APPS, "   "), None);
+        assert_eq!(pick_app(APPS, ".app"), None);
+        assert_eq!(pick_app(&[], "finder"), None);
+        assert_eq!(pick_app(&[(1, "")], "x"), None, "an app without a name never matches");
+    }
+
+    #[test]
+    fn window_title_search_is_case_insensitive_and_never_empty() {
+        assert!(title_has("Inbox (3) - lsai@example.com - Gmail", "gmail"));
+        assert!(title_has("README.md — NEXUS", "readme"));
+        assert!(!title_has("README.md — NEXUS", "notes"));
+        assert!(!title_has("anything", ""));
+        assert!(!title_has("anything", "  "));
+    }
+
+    #[test]
+    fn window_identity_line_names_the_app_then_the_window() {
+        assert_eq!(identity_line("Terminal", "claude — 80×24"), "Terminal claude — 80×24");
+        assert_eq!(identity_line("Finder", ""), "Finder");
+        assert_eq!(identity_line("Finder", "finder"), "Finder", "no doubled name");
+        assert_eq!(identity_line("", "Untitled"), "Untitled");
+        assert_eq!(identity_line(" ", " "), "");
     }
 }
