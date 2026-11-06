@@ -291,8 +291,31 @@ function installLinux() {
 /// Verify the Moonshine STT Python package is installed.
 /// The STT server (server/stt_server.py) uses Moonshine Streaming
 /// (ONNX Runtime; auto-downloads the model on first transcription).
+/// macOS: the speech server's packages live in the repo's .venv, which NEXUS looks for first
+/// (src-tauri/src/mac_interpreters.rs). Homebrew and uv Pythons refuse a global `pip install` (PEP 668).
+/// Returns the venv interpreter, creating the venv (Python 3.12 via uv when available) if needed.
+function macVenvPython() {
+  const venv = join(ROOT, ".venv");
+  const py = join(venv, "bin", "python3");
+  if (!existsSync(py)) {
+    if (has("uv")) run("uv", ["venv", "--python", "3.12", venv], { allowFail: true });
+    else run("python3", ["-m", "venv", venv], { allowFail: true });
+  }
+  return py;
+}
+
+/// `pip install` into the macOS venv. A uv-made venv has no pip of its own, so uv installs into it.
+function macVenvInstall(py, pkgs) {
+  if (has("uv")) execSync(`uv pip install --python "${py}" ${pkgs}`, { stdio: "inherit", encoding: "utf-8" });
+  else execSync(`"${py}" -m pip install ${pkgs}`, { stdio: "inherit", encoding: "utf-8" });
+}
+
 function checkMoonshine() {
-  const result = spawnSync(IS_WIN ? "python" : "python3", ["-c", "import moonshine_voice; print('ok')"], {
+  const stt = IS_MAC ? macVenvPython() : IS_WIN ? "python" : "python3";
+  const pipInstall = (pkgs) => IS_MAC
+    ? macVenvInstall(stt, pkgs)
+    : execSync(`${stt} -m pip install ${pkgs}`, { stdio: "inherit", encoding: "utf-8", shell: IS_WIN });
+  const result = spawnSync(stt, ["-c", "import moonshine_voice; print('ok')"], {
     stdio: "pipe",
     encoding: "utf-8",
     shell: IS_WIN,
@@ -303,11 +326,7 @@ function checkMoonshine() {
   } else {
     warn("moonshine-voice not installed — installing now...");
     try {
-      execSync(`${IS_WIN ? "python" : "python3"} -m pip install moonshine-voice fastapi uvicorn python-multipart websockets`, {
-        stdio: "inherit",
-        encoding: "utf-8",
-        shell: IS_WIN,
-      });
+      pipInstall("moonshine-voice fastapi uvicorn python-multipart websockets");
       ok("moonshine-voice installed successfully");
     } catch {
       warn("Failed to install moonshine-voice — STT will not work. Run: pip install moonshine-voice fastapi uvicorn python-multipart websockets");
@@ -320,7 +339,7 @@ function checkMoonshine() {
   // can still be missing it. Needed for the Phase 4 live-caption /stream
   // endpoint only — its absence degrades silently (no live caption), but
   // check for it separately so a fresh `nexus setup` actually enables it.
-  const wsResult = spawnSync(IS_WIN ? "python" : "python3", ["-c", "import websockets; print('ok')"], {
+  const wsResult = spawnSync(stt, ["-c", "import websockets; print('ok')"], {
     stdio: "pipe",
     encoding: "utf-8",
     shell: IS_WIN,
@@ -330,11 +349,7 @@ function checkMoonshine() {
   } else {
     warn("websockets not installed — installing now (live caption stream)...");
     try {
-      execSync(`${IS_WIN ? "python" : "python3"} -m pip install websockets`, {
-        stdio: "inherit",
-        encoding: "utf-8",
-        shell: IS_WIN,
-      });
+      pipInstall("websockets");
       ok("websockets installed successfully");
     } catch {
       warn("Failed to install websockets — live caption will stay disabled (batch STT unaffected). Run: pip install websockets");

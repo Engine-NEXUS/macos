@@ -41,6 +41,13 @@ pub(crate) fn well_known_candidates(home: Option<&str>) -> Vec<PathBuf> {
     v
 }
 
+/// The project venv, looked for in the folders above the executable (`src-tauri/target/debug/nexus` sits four levels
+/// under the repo root). `nexus setup` installs the speech-server packages there, because Homebrew and uv Pythons refuse
+/// a global `pip install` (PEP 668) and the first Python on `PATH` usually has none of them.
+pub(crate) fn venv_candidates(exe: &Path) -> Vec<PathBuf> {
+    exe.ancestors().skip(1).take(5).map(|d| d.join(".venv/bin/python3")).collect()
+}
+
 #[cfg(target_os = "macos")]
 fn runs(path: &Path) -> bool {
     std::process::Command::new(path)
@@ -66,7 +73,7 @@ fn command_line_tools_installed() -> bool {
 #[cfg(target_os = "macos")]
 pub(crate) fn find_python() -> Option<String> {
     let path_var = std::env::var("PATH").unwrap_or_default();
-    let mut tried: Vec<PathBuf> = Vec::new();
+    let mut tried: Vec<PathBuf> = std::env::current_exe().map(|e| venv_candidates(&e)).unwrap_or_default();
     for name in ["python3", "python"] {
         if let Some(p) = path_lookup(name, &path_var) {
             tried.push(p);
@@ -144,6 +151,15 @@ mod tests {
         assert!(!none.iter().any(|p| p.to_string_lossy().contains("pyenv")));
         let empty = well_known_candidates(Some(""));
         assert!(empty.iter().all(|p| p.is_absolute()));
+    }
+
+    #[test]
+    fn venv_candidates_reach_the_repo_root_from_a_dev_binary() {
+        let v = venv_candidates(Path::new("/r/macos/src-tauri/target/debug/nexus"));
+        assert_eq!(v[0], Path::new("/r/macos/src-tauri/target/debug/.venv/bin/python3"));
+        assert!(v.contains(&PathBuf::from("/r/macos/.venv/bin/python3")), "the repo root is four levels up");
+        assert_eq!(v.len(), 5);
+        assert!(venv_candidates(Path::new("nexus")).len() <= 1, "a bare name has no folders above it to search");
     }
 
     fn is_stub_ref(p: &PathBuf) -> bool {
