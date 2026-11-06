@@ -382,7 +382,7 @@ pub(crate) mod mac {
     /// Ask Electron (`AXManualAccessibility`, refused harmlessly by other apps) and Chromium browsers
     /// (`AXEnhancedUserInterface`) to build their web content tree. True the first time it is asked for this process,
     /// so the caller can give the tree a moment to appear.
-    fn ask_for_web_tree(app: &Owned, pid: i32, bundle_id: &str) -> bool {
+    pub(crate) fn ask_for_web_tree(app: &Owned, pid: i32, bundle_id: &str) -> bool {
         let Ok(mut asked) = WEB_TREE_ASKED.lock() else { return false };
         if asked.contains(&pid) {
             return false;

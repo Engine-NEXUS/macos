@@ -451,9 +451,9 @@ pub async fn live_ghost_whatsapp<R: tauri::Runtime>(
 }
 
 /// Ghost click (Phase 2 mouse ghost): enter ghost session, focus the app,
-/// resolve the element via UIA bounds, eased glide, click, verify the app
-/// is still foreground, glide home, exit. Stop word / mouse grab / Esc
-/// aborts cleanly at any step boundary.
+/// press the element through the Ghost Center's accessibility sub-center
+/// (UI Automation on Windows, the Accessibility API on macOS), verify,
+/// exit. Stop word / mouse grab / Esc aborts cleanly at any step boundary.
 #[tauri::command]
 pub async fn live_ghost_click<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -471,12 +471,12 @@ pub async fn live_ghost_click<R: tauri::Runtime>(
     if app_title.trim().is_empty() || element.trim().is_empty() {
         return Ok(LiveResult::err("ghost click: app and element required"));
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = app;
-        return Ok(LiveResult::err("ghost click is Windows-only for now"));
+        return Ok(LiveResult::err("ghost click needs Windows or macOS for now"));
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         match commands::mouse::ghost_click(app, &app_title, &element).await {
             Ok(msg) => Ok(LiveResult::ok(msg)),
@@ -497,14 +497,24 @@ pub async fn live_ghost_calibrate<R: tauri::Runtime>(
     if let safety::SafetyVerdict::Blocked(msg) = safety::safety_check("ghost_calibrate", None) {
         return Ok(LiveResult::err(msg));
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = app;
-        return Ok(LiveResult::err("ghost calibration is Windows-only for now"));
+        return Ok(LiveResult::err("ghost calibration needs Windows or macOS for now"));
     }
-    #[cfg(target_os = "windows")]
+    // macOS measures in points (the space enigo moves in and the cursor reads back), Windows in physical pixels.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         use commands::mouse;
+        let unit = if cfg!(target_os = "macos") { "pt" } else { "px" };
+        // Without Accessibility, macOS drops synthetic pointer moves silently and every point would read as a miss
+        // ("check display scaling"), which blames the wrong thing.
+        #[cfg(target_os = "macos")]
+        if !crate::ax_mac::trusted() {
+            return Ok(LiveResult::err(
+                "Calibration needs the Accessibility permission, sir. It is in System Settings, Privacy and Security, Accessibility.",
+            ));
+        }
         let wry = crate::ghost::ghost_wry::g_wry_ref(&app);
         crate::ghost::ghost_enter(wry.clone()).await?;
         crate::ghost::drill_begin();
@@ -523,7 +533,7 @@ pub async fn live_ghost_calibrate<R: tauri::Runtime>(
                     "poor — check display scaling"
                 };
                 let msg = format!(
-                    "Calibration: max {}px, mean {}px over {} points on {}x{}. {}",
+                    "Calibration: max {}{unit}, mean {}{unit} over {} points on {}x{}. {}",
                     rep.max_deviation_px,
                     rep.mean_deviation_px,
                     rep.points,

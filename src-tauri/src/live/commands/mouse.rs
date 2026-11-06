@@ -64,8 +64,8 @@ impl Default for PhaseTimer {
 }
 
 // Also built on macOS: enigo drives the pointer there too, and the boxes from `screen::list_actionables` (Accessibility)
-// are in the same points space enigo posts in. Only the cursor read, the fullscreen check and the Ghost session click
-// below are Windows-specific.
+// are in the same points space enigo posts in. Only the cursor read, the fullscreen check and parts of the Ghost session
+// click below (elevation gate, glide home) are Windows-specific.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub use windows_impl::*;
 
@@ -75,7 +75,6 @@ mod windows_impl {
     use enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse, Settings};
     use std::thread;
     use std::time::Duration;
-    #[cfg(target_os = "windows")]
     use tauri::Manager;
 
     /// Current cursor position (points). None when unreadable.
@@ -444,11 +443,46 @@ mod windows_impl {
         None
     }
 
-    /// Ghost click: full session-wrapped UIA click with verify + restore.
-    /// Focus app → resolve element → eased glide → click → verify still
-    /// foreground → glide home → exit. Any guard trip aborts at the next
-    /// step boundary; the session always exits with narration.
+    /// macOS: true once an app whose name contains `app_title` (the match `focus_app_by_title` asked System Events for)
+    /// is in front. System Events raises the app and returns before macOS has switched, and the Accessibility Center
+    /// acts on whichever app is in front, so the click waits for the switch. Gives up after 1.5 s.
+    #[cfg(target_os = "macos")]
+    async fn wait_until_front(app_title: &str) -> bool {
+        let want = app_title.trim().to_lowercase();
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        loop {
+            if crate::macos_foreground::front_app().is_some_and(|f| f.name.to_lowercase().contains(&want)) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+    }
+
+    /// Windows: glide the pointer back where it was (the cursor fallback may have moved it). Returns "" or the spoken
+    /// note for a failed glide.
     #[cfg(target_os = "windows")]
+    fn glide_home(home: Option<(i32, i32)>) -> String {
+        match home {
+            Some(h) if restore(h).is_err() => " (couldn't glide back)".to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// macOS: the Accessibility Center presses through the API and never moves the pointer, so any movement since the
+    /// start is the user's own; gliding "home" would only fight them for it.
+    #[cfg(target_os = "macos")]
+    fn glide_home(_home: Option<(i32, i32)>) -> String {
+        String::new()
+    }
+
+    /// Ghost click: full session-wrapped accessible click with verify + restore.
+    /// Focus app → Ghost Center accessibility sub-center (UI Automation on
+    /// Windows, the Accessibility API on macOS) → verify → glide home (Windows)
+    /// → exit. Any guard trip aborts at the next step boundary; the session
+    /// always exits with narration.
     pub async fn ghost_click<R: tauri::Runtime>(
         app: tauri::AppHandle<R>,
         app_title: &str,
@@ -480,9 +514,15 @@ mod windows_impl {
             if !super::super::window::focus_app_by_title(app_title) {
                 return Err(format!("couldn't find {app_title} running, sir."));
             }
+            #[cfg(target_os = "macos")]
+            if !wait_until_front(app_title).await {
+                return Err(format!("{app_title} didn't come to the front, sir."));
+            }
             // 1b. UIPI elevation gate: an elevated target silently eats
             // clicks from our unelevated process — reroute with speech
-            // instead of clicking into the void.
+            // instead of clicking into the void. (A Mac has no elevated
+            // windows; the Ghost Center refuses its security prompts.)
+            #[cfg(target_os = "windows")]
             if let Some(hwnd) = super::super::window::find_window(app_title) {
                 let target_elevated =
                     super::super::window::window_process_elevated(hwnd);
@@ -526,15 +566,8 @@ mod windows_impl {
         // Restore pre-act position — but NEVER after a stop/takeover:
         // gliding home into the user's hands fights them for the cursor.
         // A failed glide home is reported, never silent.
-        let mut restore_note = String::new();
         let calm = !stop();
-        if calm {
-            if let Some(h) = home {
-                if restore(h).is_err() {
-                    restore_note = " (couldn't glide back)".to_string();
-                }
-            }
-        }
+        let restore_note = if calm { glide_home(home) } else { String::new() };
 
         timer.mark("restore_home");
         let clean =
@@ -545,9 +578,10 @@ mod windows_impl {
         let _ = crate::ghost::ghost_exit(crate::ghost::ghost_wry::g_wry(app.clone())).await;
         timer.mark("exit");
         tracing::info!(
-            "[GHOST-TIMING] click '{}' ok={} tier=uia {}",
+            "[GHOST-TIMING] click '{}' ok={} tier={} {}",
             element,
             run.is_ok(),
+            if cfg!(target_os = "macos") { "ax" } else { "uia" },
             timer.summary()
         );
 
