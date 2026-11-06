@@ -63,18 +63,29 @@ impl Default for PhaseTimer {
     }
 }
 
-#[cfg(target_os = "windows")]
+// Also built on macOS: enigo drives the pointer there too, and the boxes from `screen::list_actionables` (Accessibility)
+// are in the same points space enigo posts in. Only the cursor read, the fullscreen check and the Ghost session click
+// below are Windows-specific.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub use windows_impl::*;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 mod windows_impl {
     use super::eased_steps;
     use enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse, Settings};
     use std::thread;
     use std::time::Duration;
+    #[cfg(target_os = "windows")]
     use tauri::Manager;
 
+    /// Current cursor position (points). None when unreadable.
+    #[cfg(target_os = "macos")]
+    pub fn current_pos() -> Option<(i32, i32)> {
+        crate::hand::cursor_pos()
+    }
+
     /// Current cursor position (physical px). None when unreadable.
+    #[cfg(target_os = "windows")]
     pub fn current_pos() -> Option<(i32, i32)> {
         use windows::Win32::Foundation::POINT;
         use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
@@ -315,6 +326,7 @@ mod windows_impl {
     /// covers the whole monitor): games and some players swallow synthetic
     /// input or sit above the overlay. Ghost acts pause with a spoken
     /// message instead of clicking into the void.
+    #[cfg(target_os = "windows")]
     pub fn is_foreground_fullscreen() -> bool {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, IsZoomed};
@@ -436,6 +448,7 @@ mod windows_impl {
     /// Focus app → resolve element → eased glide → click → verify still
     /// foreground → glide home → exit. Any guard trip aborts at the next
     /// step boundary; the session always exits with narration.
+    #[cfg(target_os = "windows")]
     pub async fn ghost_click<R: tauri::Runtime>(
         app: tauri::AppHandle<R>,
         app_title: &str,
@@ -563,7 +576,7 @@ mod windows_impl {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod unix_stub {
     /// Non-Windows: mouse ghost is Windows-only for now (Ghost plan).
     pub fn current_pos() -> Option<(i32, i32)> {
@@ -571,7 +584,7 @@ mod unix_stub {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub use unix_stub::current_pos;
 
 #[cfg(test)]
@@ -621,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn test_score_name_ranking() {
         assert_eq!(score_name("Save", "save"), Some(3));
         assert_eq!(score_name("Save As", "save"), Some(2));
@@ -630,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn test_score_name_normalizes_and_rejects_empty() {
         assert_eq!(score_name("  SAVE  ", "save"), Some(3));
         assert_eq!(score_name("Save", "  "), None);
@@ -639,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn test_score_name_password_shaped_names_still_score() {
         // Scoring is dumb on purpose: password EXCLUSION lives in
         // screen.rs listing (skipped upstream) + the safety denylist.
@@ -649,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn test_score_name_noise_word_stripping() {
         assert_eq!(score_name("Search", "search bar"), Some(2));
         assert_eq!(score_name("Search or start new chat", "search bar"), Some(2));

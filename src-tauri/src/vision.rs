@@ -495,7 +495,7 @@ pub async fn resolve_named_target(
     api_key: &str,
     client: &reqwest::Client,
 ) -> Option<crate::screen::UiElement> {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     if let Some(el) = crate::live::commands::mouse::resolve_element(name) {
         return Some(el);
     }

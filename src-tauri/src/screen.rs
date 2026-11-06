@@ -337,6 +337,8 @@ pub use win::{click_element, foreground_window_element, list_actionables, list_a
 
 #[cfg(not(target_os = "windows"))]
 pub use unix_extra::{list_actionables, primary_monitor_size};
+#[cfg(target_os = "macos")]
+pub use unix_extra::click_element;
 
 #[cfg(target_os = "windows")]
 mod win_extra {
@@ -365,11 +367,29 @@ pub use win_extra::primary_monitor_size;
 mod unix_extra {
     use super::UiElement;
 
-    /// macOS: AXUIElement structure reading lands with the Phase 3 port.
-    /// Until then grounding falls back to hotkeys/coarse clicks instead of
-    /// being a build break.
+    /// macOS: the front window's controls through the Accessibility API (`ax_mac`). Elsewhere: none, so grounding
+    /// falls back to hotkeys/coarse clicks.
     pub fn list_actionables() -> Vec<UiElement> {
-        Vec::new()
+        #[cfg(target_os = "macos")]
+        {
+            crate::ax_mac::list_actionables()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// Move the mouse to an element's center and left-click (points, the space the Accessibility boxes use).
+    #[cfg(target_os = "macos")]
+    pub fn click_element(el: &UiElement) -> Result<(), String> {
+        use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings};
+        let mut enigo = Enigo::new(&Settings::default()).map_err(|e| format!("enigo init: {e}"))?;
+        enigo
+            .move_mouse(el.x + el.w / 2, el.y + el.h / 2, Coordinate::Abs)
+            .map_err(|e| format!("mouse move: {e}"))?;
+        enigo.button(Button::Left, Direction::Click).map_err(|e| format!("mouse click: {e}"))?;
+        Ok(())
     }
 
     /// Primary display in macOS POINTS (probe via `screen_capture_mac`), so

@@ -4408,7 +4408,7 @@ async fn run_screen_click<R: Runtime>(
     ordinal: u32,
 ) -> Result<ProcessResult, String> {
     let (request_id, _) = install_new_request(Subsystem::LocalCommand);
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let els = crate::screen::list_actionables();
         match crate::screen::pick_ordinal(&els, ordinal) {
@@ -4426,7 +4426,7 @@ async fn run_screen_click<R: Runtime>(
             ),
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = ordinal;
         speak_line(&app, "Screen clicking needs Windows, sir.".to_string(), &request_id);
@@ -4480,7 +4480,7 @@ async fn run_screen_read<R: Runtime>(
     ordinal: u32,
 ) -> Result<ProcessResult, String> {
     let (request_id, _) = install_new_request(Subsystem::LocalCommand);
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let els = crate::screen::list_actionables();
         match crate::screen::pick_ordinal(&els, ordinal) {
@@ -4496,7 +4496,7 @@ async fn run_screen_read<R: Runtime>(
             ),
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = ordinal;
         speak_line(&app, "Screen reading needs Windows, sir.".to_string(), &request_id);
@@ -9076,12 +9076,12 @@ async fn run_click_element<R: Runtime>(app: AppHandle<R>, name: String) -> Resul
         return Ok(ProcessResult { request_id, subsystem: Subsystem::LocalCommand, handled_locally: true });
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         speak_line(&app, "Clicking by name isn't available on this platform, sir.".to_string(), &request_id);
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let name_clone = name.clone();
         let resolved = tokio::task::spawn_blocking(move || {

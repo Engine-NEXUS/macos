@@ -344,27 +344,21 @@ fn guard_now() -> Option<String> {
 /// Where is the real cursor? On macOS this is a plain CoreGraphics call — the
 /// same points coordinate space enigo's `Coordinate::Abs` posts in, so engine
 /// seeding and the takeover check see consistent values.
+///
+/// `CGEventGetLocation` returns a CGPoint (two doubles). It used to be declared as returning a rect (four doubles),
+/// which only read the right values by luck of the Apple-silicon register ABI; on Intel the result comes back through
+/// memory and was garbage. Shared with `live::commands::mouse` (Ghost/"click X" pointer checks).
 #[cfg(target_os = "macos")]
-fn cursor_pos() -> Option<(i32, i32)> {
+pub(crate) fn cursor_pos() -> Option<(i32, i32)> {
     #[repr(C)]
     struct MacPoint {
         x: f64,
         y: f64,
     }
-    #[repr(C)]
-    struct MacSize {
-        w: f64,
-        h: f64,
-    }
-    #[repr(C)]
-    struct MacRect {
-        origin: MacPoint,
-        size: MacSize,
-    }
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGEventCreate(unknown: *const core::ffi::c_void) -> *mut core::ffi::c_void;
-        fn CGEventGetLocation(ev: *mut core::ffi::c_void) -> MacRect;
+        fn CGEventGetLocation(ev: *mut core::ffi::c_void) -> MacPoint;
         fn CFRelease(cf: *mut core::ffi::c_void);
     }
     unsafe {
@@ -372,9 +366,9 @@ fn cursor_pos() -> Option<(i32, i32)> {
         if ev.is_null() {
             return None;
         }
-        let r = CGEventGetLocation(ev);
+        let p = CGEventGetLocation(ev);
         CFRelease(ev);
-        Some((r.origin.x.round() as i32, r.origin.y.round() as i32))
+        Some((p.x.round() as i32, p.y.round() as i32))
     }
 }
 

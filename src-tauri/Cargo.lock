@@ -3619,6 +3619,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "circular-buffer",
+ "core-foundation-sys",
  "cpal",
  "dirs-next",
  "edge-tts-rust",

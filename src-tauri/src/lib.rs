@@ -150,6 +150,10 @@ pub(crate) mod screen_capture_mac;
 // Frontmost app on macOS (lsappinfo + System Events). Pure parsers are compiled in tests on every OS.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod macos_foreground;
+// macOS Accessibility reading for screen grounding (the macOS side of UI Automation in screen.rs). Pure parts are
+// compiled in tests on every OS.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod ax_mac;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod mac_interpreters;
 
