@@ -266,7 +266,7 @@ pub async fn coderabbit_install() -> Result<CodeRabbitStatus, String> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let mut cmd = crate::no_window::command("sh");
+        let mut cmd = Command::new("sh");
         cmd.args(&[
             "-c",
             "curl -fsSL https://cli.coderabbit.ai/install.sh | sh",
