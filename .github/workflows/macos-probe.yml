@@ -12,7 +12,7 @@ on:
 jobs:
   probe:
     name: macOS command probe
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: System
         run: |
