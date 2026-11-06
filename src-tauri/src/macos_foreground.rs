@@ -173,12 +173,129 @@ pub(crate) fn front_app() -> Option<FrontApp> {
     parse_front_app(&out)
 }
 
+/// Every app record of `lsappinfo list` output as (ASN, app), e.g. ("0x0-0x271271", Calculator). Records without a pid
+/// are skipped.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_app_records(list_output: &str) -> Vec<(String, FrontApp)> {
+    let mut out: Vec<(String, FrontApp)> = Vec::new();
+    let mut cur: Option<(String, String, Option<String>, Option<u32>)> = None;
+    let mut flush = |cur: &mut Option<(String, String, Option<String>, Option<u32>)>, out: &mut Vec<(String, FrontApp)>| {
+        if let Some((asn, name, bundle_id, Some(pid))) = cur.take() {
+            out.push((asn, FrontApp { name, bundle_id, pid }));
+        }
+    };
+    for line in list_output.lines() {
+        let t = line.trim();
+        // header: `<n>) "<name>" ASN:0x0-xxxx: [(in front)]`
+        if let Some((num, rest)) = t.split_once(')') {
+            let rest = rest.trim_start();
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) && rest.starts_with('"') {
+                flush(&mut cur, &mut out);
+                if let Some(end) = rest.find("\" ASN:") {
+                    let asn = rest[end + 6..].split(':').next().unwrap_or("").trim().to_string();
+                    cur = Some((asn, rest[1..end].to_string(), None, None));
+                }
+                continue;
+            }
+        }
+        let Some(rec) = cur.as_mut() else { continue };
+        if let Some(v) = t.strip_prefix("bundleID=") {
+            if let Some(inner) = v.trim().strip_prefix('"') {
+                rec.2 = inner.find('"').map(|end| inner[..end].to_string());
+            }
+        } else if let Some(v) = t.strip_prefix("pid = ") {
+            rec.3 = v.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok();
+        }
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
+/// The ASNs of `lsappinfo visibleProcessList` output, front to back. The list holds regular apps only (not NEXUS,
+/// which runs as a UI element), e.g. `ASN:0x0-0x205205-"Terax": ASN:0x0-0x271271-"Calculator":`.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_visible_order(visible_output: &str) -> Vec<String> {
+    visible_output
+        .split("ASN:")
+        .filter_map(|part| part.split_once("-\"").map(|(asn, _)| asn.trim().to_string()))
+        .filter(|asn| !asn.is_empty())
+        .collect()
+}
+
+/// The front-most visible app that is not `own_pid`: the app the user was working in when NEXUS's own window (the
+/// sidebar) took focus. Pure.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn first_visible_except(list_output: &str, visible_output: &str, own_pid: u32) -> Option<FrontApp> {
+    let records = parse_app_records(list_output);
+    parse_visible_order(visible_output)
+        .iter()
+        .filter_map(|asn| records.iter().find(|(a, _)| a == asn).map(|(_, app)| app))
+        .find(|app| app.pid != own_pid)
+        .cloned()
+}
+
+/// The app directly behind NEXUS (see `first_visible_except`), or None when it cannot be read.
+#[cfg(target_os = "macos")]
+pub(crate) fn app_behind_nexus() -> Option<FrontApp> {
+    let limit = Duration::from_millis(1500);
+    let visible = run_capture(Command::new("lsappinfo").arg("visibleProcessList"), limit)?;
+    let list = run_capture(Command::new("lsappinfo").arg("list"), limit)?;
+    first_visible_except(&list, &visible, std::process::id())
+}
+
 /// Title of the front window of the process `pid`. Some("") means "no window / no name"; None means System Events could
 /// not be asked (Automation permission missing or denied, or it timed out).
 #[cfg(target_os = "macos")]
 pub(crate) fn window_title(pid: u32) -> Option<String> {
     let out = run_capture(Command::new("osascript").args(title_args(pid)), Duration::from_millis(1500))?;
     Some(clean_title(&out))
+}
+
+#[cfg(test)]
+mod behind_nexus_tests {
+    use super::*;
+
+    // Captured on a real Mac (macOS 27.2) with NEXUS's sidebar open: NEXUS is a UI element, so it is in `list` but not
+    // in `visibleProcessList`.
+    const LIST: &str = r#"
+72) "Terax" ASN:0x0-0x205205: (in front)
+    bundleID="app.crynta.terax"
+    pid = 29010 token=[sess=100015 pid=29010 uid:501,501,501 g:20,20 pV:56103] type="Foreground" flavor=3
+84) "nexus" ASN:0x0-0x269269:
+    bundleID=[ NULL ]
+    pid = 42389 token=[sess=100015 pid=42389 uid:501,501,501 g:20,20 pV:83917] type="UIElement" flavor=3
+88) "Calculator" ASN:0x0-0x271271:
+    bundleID="com.apple.calculator"
+    pid = 43144 token=[sess=100015 pid=43144 uid:501,501,501 g:20,20 pV:85285] type="Foreground" flavor=3
+"#;
+    const VISIBLE: &str =
+        r#"ASN:0x0-0x271271-"Calculator": ASN:0x0-0x205205-"Terax": ASN:0x0-0x256256-"Brave_Browser": ASN:0x0-0x38038-"Finder":"#;
+
+    #[test]
+    fn records_carry_asn_name_bundle_and_pid() {
+        let r = parse_app_records(LIST);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[2].0, "0x0-0x271271");
+        assert_eq!(r[2].1, FrontApp { name: "Calculator".into(), bundle_id: Some("com.apple.calculator".into()), pid: 43144 });
+        assert_eq!(r[1].1.bundle_id, None, "NULL bundle id");
+    }
+
+    #[test]
+    fn visible_order_is_front_to_back() {
+        assert_eq!(parse_visible_order(VISIBLE), ["0x0-0x271271", "0x0-0x205205", "0x0-0x256256", "0x0-0x38038"]);
+        assert!(parse_visible_order("").is_empty());
+    }
+
+    #[test]
+    fn the_app_behind_nexus_is_the_first_visible_one_that_is_not_nexus() {
+        let behind = first_visible_except(LIST, VISIBLE, 42389).unwrap();
+        assert_eq!(behind.name, "Calculator");
+        // If our own pid were first in the visible list it is skipped.
+        let behind = first_visible_except(LIST, VISIBLE, 43144).unwrap();
+        assert_eq!(behind.name, "Terax");
+        // Apps missing from `list` (Brave, Finder here) are passed over, not invented.
+        assert_eq!(first_visible_except(LIST, r#"ASN:0x0-0x256256-"Brave_Browser":"#, 1), None);
+    }
 }
 
 #[cfg(test)]

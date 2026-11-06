@@ -336,6 +336,12 @@ mod unix_impl {
         false
     }
 
+    /// Bring the app with `pid` (and its main window) to the front; true once it is. Used when NEXUS's own window holds
+    /// focus and a screen command must act on the app behind it.
+    pub fn bring_app_to_front(pid: u32) -> bool {
+        bring_to_front(pid, None)
+    }
+
     /// Activate the app and raise `window` (else its main window). macOS 14+ may decline a background app's activation
     /// request; the Accessibility `AXFrontmost` attribute is the fallback.
     fn bring_to_front(pid: u32, window: Option<Owned>) -> bool {

@@ -399,9 +399,16 @@ pub(crate) mod mac {
         if !trusted() {
             return Err("Accessibility permission missing (System Settings → Privacy & Security → Accessibility)".into());
         }
-        let front = crate::macos_foreground::front_app().ok_or("cannot tell which app is in front")?;
+        let mut front = crate::macos_foreground::front_app().ok_or("cannot tell which app is in front")?;
         if front.pid == std::process::id() {
-            return Err("NEXUS itself is in front".into());
+            // NEXUS's sidebar takes focus when it shows a result, so the next "click X" would see NEXUS. The user means
+            // the app they were working in: the first visible app behind NEXUS, brought back to the front so a click
+            // lands as a click and not as the click that activates the window.
+            front = crate::macos_foreground::app_behind_nexus().ok_or("NEXUS itself is in front, with no app behind it")?;
+            if !crate::live::commands::window::bring_app_to_front(front.pid) {
+                return Err(format!("NEXUS is in front and {} did not come back to the front", front.name));
+            }
+            tracing::info!("[AX] NEXUS was in front; acting on {} behind it", front.name);
         }
         // SAFETY: plain constructors; both return +1 references.
         let system = Owned::new(unsafe { AXUIElementCreateSystemWide() }).ok_or("no system-wide element")?;
