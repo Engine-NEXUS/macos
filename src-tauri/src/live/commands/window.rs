@@ -648,4 +648,53 @@ mod tests {
         assert_eq!(identity_line("", "Untitled"), "Untitled");
         assert_eq!(identity_line(" ", " "), "");
     }
+
+    /// Live: maximize, minimize and focus on a scratch TextEdit document (never the user's windows). Refuses to run
+    /// while TextEdit is already open, because it quits TextEdit at the end.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "opens and quits TextEdit, moves focus; needs the Accessibility permission"]
+    fn live_mac_maximize_minimize_and_focus_a_scratch_textedit_window() {
+        use super::{focus_app_by_title, maximize_foreground_window, minimize_foreground_window};
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+        let running = |name: &str| Command::new("pgrep").args(["-x", name]).status().is_ok_and(|s| s.success());
+        assert!(!running("TextEdit"), "close TextEdit first: this test quits it at the end");
+        let front_is = |name: &str| crate::macos_foreground::front_app().is_some_and(|f| f.name == name);
+        let was_front = crate::macos_foreground::front_app();
+        let doc = std::env::temp_dir().join(format!("nexus-window-test-{}.txt", std::process::id()));
+        std::fs::write(&doc, "NEXUS window test\n").unwrap();
+        Command::new("open").args(["-a", "TextEdit"]).arg(&doc).status().unwrap();
+        let t0 = Instant::now();
+        while !(front_is("TextEdit") && crate::ax_mac::mac::front_window_frame().is_some()) {
+            assert!(t0.elapsed() < Duration::from_secs(10), "TextEdit never showed its window");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let result = std::panic::catch_unwind(|| {
+            let (screen_w, _) = crate::screen::primary_monitor_size().unwrap();
+            assert!(maximize_foreground_window(), "maximize");
+            std::thread::sleep(Duration::from_millis(300));
+            let (_, f) = crate::ax_mac::mac::front_window_frame().unwrap();
+            eprintln!("maximized frame: {f:?} (screen width {screen_w})");
+            assert!(f.w >= screen_w as f64 * 0.95, "fills the screen width");
+            assert!(minimize_foreground_window(), "minimize");
+            std::thread::sleep(Duration::from_millis(600));
+            assert!(focus_app_by_title("Finder"), "focus another app");
+            assert!(!front_is("TextEdit"));
+            assert!(focus_app_by_title("TextEdit"), "focus TextEdit back");
+            std::thread::sleep(Duration::from_millis(600));
+            let back = crate::ax_mac::mac::front_window_frame();
+            eprintln!("after refocus: {back:?}");
+            assert!(back.is_some(), "its window came back from the Dock");
+        });
+        let _ = Command::new("pkill").args(["-x", "TextEdit"]).status();
+        let _ = std::fs::remove_file(&doc);
+        // Hand the screen back to whatever the user had in front.
+        if let Some(b) = was_front.and_then(|f| f.bundle_id) {
+            let _ = Command::new("open").args(["-b", &b]).status();
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
 }
