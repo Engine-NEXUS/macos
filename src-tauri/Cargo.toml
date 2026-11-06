@@ -211,7 +211,9 @@ keyring = { version = "3", features = ["apple-native"] }
 # ax_mac.rs: Core Foundation types for the Accessibility API (screen grounding). Already in the tree via tauri.
 core-foundation-sys = "0.8"
 # Objective-C runtime calls (Vision OCR, NSScreen frames) without extra binding crates. Already in the tree via tauri.
-objc2 = "0.6"
+# `exception`: ocr_mac.rs catches Objective-C exceptions instead of aborting (release builds use panic = "abort"). Its
+# helper crate is already in Cargo.lock (wry enables the same feature).
+objc2 = { version = "0.6", features = ["exception"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
