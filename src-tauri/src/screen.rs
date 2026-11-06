@@ -380,16 +380,14 @@ mod unix_extra {
         }
     }
 
-    /// Move the mouse to an element's center and left-click (points, the space the Accessibility boxes use).
+    /// Glide to an element's center and left-click (points, the space the Accessibility boxes use). Not a teleport
+    /// plus instant click as on Windows: on macOS a click posted right after a jump lands at the old pointer position
+    /// (measured with Calculator: the "7" never registered). The glide, arrival dwell and pointer check of
+    /// `mouse::click_at` are what "click X" by name already uses.
     #[cfg(target_os = "macos")]
     pub fn click_element(el: &UiElement) -> Result<(), String> {
-        use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings};
-        let mut enigo = Enigo::new(&Settings::default()).map_err(|e| format!("enigo init: {e}"))?;
-        enigo
-            .move_mouse(el.x + el.w / 2, el.y + el.h / 2, Coordinate::Abs)
-            .map_err(|e| format!("mouse move: {e}"))?;
-        enigo.button(Button::Left, Direction::Click).map_err(|e| format!("mouse click: {e}"))?;
-        Ok(())
+        let (x, y) = crate::live::commands::mouse::element_center(el);
+        crate::live::commands::mouse::click_at(x, y, || false)
     }
 
     /// Primary display in macOS POINTS (probe via `screen_capture_mac`), so
