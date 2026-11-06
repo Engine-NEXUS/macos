@@ -9,7 +9,11 @@
 //! for browsers, else the window), so tabs / URL bar / taskbar never reach
 //! the model. The page URL is OPTIONAL: it enriches the answer, it never
 //! decides whether a capture may happen. Everything pure here is unit-tested;
-//! the Windows probes and the oEmbed call are thin glue around it.
+//! the Windows probes and the oEmbed call are thin glue around it. On macOS
+//! the same target comes from `lsappinfo` and the Accessibility API (front
+//! window title and frame, in points) and the browser URL from `AXDocument`
+//! or AppleScript; there is no page-content rectangle, so browsers use the
+//! toolbar-inset window.
 
 use std::collections::HashMap;
 use sha2::{Digest, Sha256};
@@ -190,12 +194,50 @@ pub fn parse_oembed(json: &str) -> Option<YoutubeMeta> {
     Some(YoutubeMeta { title, author })
 }
 
+/// Browser families the macOS probe tells apart: the Chromium family and
+/// Safari can report their page URL through AppleScript, Firefox cannot.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacBrowser {
+    Chromium,
+    Safari,
+    Firefox,
+}
+
+/// The browser family of a macOS app key (its lower-case bundle id, as the
+/// mac probe reports it). The Chromium list is the one `ax_mac` already keeps
+/// for asking those browsers for their web tree. Pure.
+#[cfg(any(target_os = "macos", test))]
+fn mac_browser(key: &str) -> Option<MacBrowser> {
+    let key = key.trim().to_ascii_lowercase();
+    if crate::ax_mac::wants_enhanced_ui(&key) {
+        return Some(MacBrowser::Chromium);
+    }
+    match key.as_str() {
+        "com.apple.safari" | "com.apple.safaritechnologypreview" => Some(MacBrowser::Safari),
+        "org.mozilla.firefox" | "org.mozilla.firefoxdeveloperedition" | "org.mozilla.nightly" => {
+            Some(MacBrowser::Firefox)
+        }
+        _ => None,
+    }
+}
+
+/// A browser holds the window: a Windows browser executable, or on macOS a
+/// browser bundle id. Pure.
+fn is_browser_app(app: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    if mac_browser(app).is_some() {
+        return true;
+    }
+    crate::browser_url::is_browser_process(app)
+}
+
 /// Pure classification of the foreground content.
 pub fn classify_content(app: &str, url: Option<&str>) -> ContentKind {
     if url.map(|u| youtube_video_id(u).is_some()).unwrap_or(false) {
         return ContentKind::Video;
     }
-    if crate::browser_url::is_browser_process(app) {
+    if is_browser_app(app) {
         return ContentKind::BrowserPage;
     }
     if app.is_empty() {
@@ -229,7 +271,7 @@ pub fn toolbar_inset(window_h: i32) -> i32 {
 /// window rect minus a toolbar inset / (other app) window rect → full
 /// monitor. Anything too small or off-monitor falls through. Pure.
 pub fn choose_region(raw: &RawContext, mw: i32, mh: i32) -> Region {
-    let is_browser = crate::browser_url::is_browser_process(&raw.app);
+    let is_browser = is_browser_app(&raw.app);
     if let Some((x, y, w, h)) = raw.document_rect {
         if let Some(r) = clamp_region(x, y, w, h, mw, mh) {
             return r;
@@ -285,6 +327,54 @@ pub fn build_context(
         region,
         ocr_lines: Vec::new(),
     }
+}
+
+/// The macOS probe result as a `RawContext`. The Accessibility frame
+/// (fractional global top-left points) becomes the window rectangle in whole
+/// points; a non-finite or empty frame is dropped, so the target stays
+/// unverified and capture is refused. macOS gives no page-content rectangle
+/// here, so a browser falls back to the window minus a toolbar inset. Pure.
+#[cfg(any(target_os = "macos", test))]
+fn mac_raw_context(
+    app: String,
+    title: String,
+    url: Option<String>,
+    frame: Option<(f64, f64, f64, f64)>,
+) -> RawContext {
+    let window_rect = frame.and_then(|(x, y, w, h)| {
+        let sane = [x, y, w, h].iter().all(|v| v.is_finite() && v.abs() < 1.0e6);
+        (sane && w >= 1.0 && h >= 1.0)
+            .then(|| (x.round() as i32, y.round() as i32, w.round() as i32, h.round() as i32))
+    });
+    RawContext { app, title, url, document_rect: None, window_rect }
+}
+
+/// A page URL as a macOS browser reported it, kept only when it is a plain
+/// http(s) address: not `favorites://`, a blank tab or AppleScript error text.
+/// Pure.
+#[cfg(any(target_os = "macos", test))]
+fn mac_page_url(raw: &str) -> Option<String> {
+    let url = raw.trim();
+    let lower = url.to_ascii_lowercase();
+    let web = lower.starts_with("https://") || lower.starts_with("http://");
+    (web && url.len() <= 4096 && !url.chars().any(char::is_whitespace)).then(|| url.to_string())
+}
+
+/// AppleScript returning the page URL of the front window of the browser with
+/// `bundle_id`. The browser is addressed by its own id, so only the one in
+/// front is asked and nothing is launched. The id is part of the script text
+/// (AppleScript needs the literal to load that browser's terms), so only a
+/// plain bundle id is accepted. Firefox has no scriptable URL. Pure.
+#[cfg(any(target_os = "macos", test))]
+fn mac_url_script(browser: MacBrowser, bundle_id: &str) -> Option<String> {
+    let plain = !bundle_id.is_empty()
+        && bundle_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    let tab = match browser {
+        MacBrowser::Chromium => "active tab",
+        MacBrowser::Safari => "current tab",
+        MacBrowser::Firefox => return None,
+    };
+    plain.then(|| format!("tell application id \"{bundle_id}\" to return URL of {tab} of front window"))
 }
 
 /// A screen may be captured only when the foreground probe identified a
@@ -443,7 +533,55 @@ fn probe_blocking() -> RawContext {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+/// macOS probes, the counterpart of the UI Automation ones above. The front
+/// app comes from `lsappinfo`, keyed by its lower-case bundle id (the key the
+/// safety denylist and `browser_url::foreground_process_name` use). Its
+/// focused window's title and frame come from the Accessibility API, which
+/// never prompts: without that permission, or with NEXUS itself in front, the
+/// probe is empty and capture is refused. The frame is in global top-left
+/// points, the space `screen_capture_mac` captures in.
+#[cfg(target_os = "macos")]
+fn probe_blocking() -> RawContext {
+    use crate::ax_mac::mac;
+    let Ok((front, _app, window)) = mac::front_window() else {
+        return RawContext::default();
+    };
+    let Some(node) = mac::read_node(&window, &mac::names(mac::NODE_ATTRS)) else {
+        return RawContext::default();
+    };
+    let key = front.key();
+    let url = mac_browser(&key)
+        .and_then(|browser| mac_browser_url(browser, &window, front.bundle_id.as_deref()));
+    mac_raw_context(key, node.title, url, node.frame.map(|f| (f.x, f.y, f.w, f.h)))
+}
+
+/// The front browser window's page URL on macOS. The window's `AXDocument`
+/// (Safari reports the page there) needs no further permission. Otherwise
+/// Safari and the Chromium family are asked through AppleScript, which shows
+/// macOS's Automation prompt for that browser the first time. While the prompt
+/// is open the read times out, and once it is refused the read fails at once;
+/// either way the URL stays unknown, which capture does not depend on.
+#[cfg(target_os = "macos")]
+fn mac_browser_url(
+    browser: MacBrowser,
+    window: &crate::ax_mac::mac::Owned,
+    bundle_id: Option<&str>,
+) -> Option<String> {
+    use crate::ax_mac::mac;
+    // SAFETY: `string_of` checks the value's type; `v` is held while it is read.
+    let document = mac::copy_attr(window, "AXDocument").map(|v| unsafe { mac::string_of(v.0) });
+    if let Some(url) = document.as_deref().and_then(mac_page_url) {
+        return Some(url);
+    }
+    let script = mac_url_script(browser, bundle_id?)?;
+    let out = crate::macos_foreground::run_capture(
+        std::process::Command::new("osascript").args(["-e", &script]),
+        std::time::Duration::from_millis(1200),
+    )?;
+    mac_page_url(&out)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn probe_blocking() -> RawContext {
     RawContext::default()
 }
@@ -495,19 +633,17 @@ pub async fn collect_target(mw: i32, mh: i32) -> ScreenContext {
     context
 }
 
-/// Add public video metadata and local OCR clues after the short spoken
-/// acknowledgement. Every capture remains scoped to the frozen target.
-/// Feature 98 P3 text clues come from Windows WinRT OCR; off Windows the
-/// vision model proceeds without local text grounding (Vision-framework
-/// OCR lands with the Phase 3 port).
-#[cfg(target_os = "windows")]
+/// Feature 98 P3 text clues from local OCR: WinRT OCR on Windows, the Vision
+/// framework on macOS (`ocr_mac`, mounted as `crate::ocr`). Elsewhere the
+/// vision model proceeds without local text grounding.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn capture_ocr_clue_rects(
     x: i32, y: i32, w: i32, h: i32,
 ) -> Option<(String, Vec<(i32, i32, i32, i32)>)> {
     crate::ocr::capture_region_text_rects(x, y, w, h)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn capture_ocr_clue_rects(
     _x: i32, _y: i32, _w: i32, _h: i32,
 ) -> Option<(String, Vec<(i32, i32, i32, i32)>)> {
@@ -943,5 +1079,172 @@ mod tests {
         let mut other = raw.clone();
         other.url = Some("https://example.com/other".into());
         assert!(!same_capture_target(&with_url, &build_context(&other, None, 1920, 1080)));
+    }
+
+    // ─── macOS probe → context ──────────────────────────────────────────
+    // A 14-inch MacBook's main display in points; the menu bar is 37 pt tall.
+    const MW: i32 = 1512;
+    const MH: i32 = 982;
+
+    #[test]
+    fn mac_window_frame_becomes_a_verified_capture_region() {
+        let raw = mac_raw_context(
+            "com.apple.textedit".into(),
+            "notes.txt".into(),
+            None,
+            Some((100.4, 37.6, 900.2, 700.0)),
+        );
+        let ctx = build_context(&raw, None, MW, MH);
+        assert_eq!(ctx.region, Region { x: 100, y: 38, w: 900, h: 700 });
+        assert!(ctx.region_verified && !ctx.full_screen && !ctx.sensitive);
+        assert_eq!(ctx.kind, ContentKind::App);
+        assert_eq!(capture_block_reason(&ctx), None);
+        assert!(same_capture_target(&ctx, &ctx));
+    }
+
+    #[test]
+    fn mac_missing_or_broken_frames_refuse_the_capture() {
+        for frame in [
+            None,
+            Some((f64::NAN, 0.0, 800.0, 600.0)),
+            Some((0.0, 0.0, f64::INFINITY, 600.0)),
+            Some((10.0, 40.0, 0.0, 600.0)),
+            Some((10.0, 40.0, 800.0, 0.4)),
+            Some((0.0, 0.0, 1.0e9, 600.0)),
+        ] {
+            let raw = mac_raw_context("com.apple.textedit".into(), "a.txt".into(), None, frame);
+            assert_eq!(raw.window_rect, None, "frame {frame:?}");
+            assert!(capture_block_reason(&build_context(&raw, None, MW, MH)).is_some(), "frame {frame:?}");
+        }
+        // The probe found nothing at all (no Accessibility, NEXUS in front).
+        assert!(capture_block_reason(&build_context(&RawContext::default(), None, MW, MH)).is_some());
+    }
+
+    #[test]
+    fn mac_window_on_a_second_display_is_not_captured_from_the_main_one() {
+        // Entirely right of the main display: nothing of it is on the captured display.
+        let away = mac_raw_context("com.apple.textedit".into(), "a.txt".into(), None, Some((1600.0, 100.0, 800.0, 600.0)));
+        assert!(capture_block_reason(&build_context(&away, None, MW, MH)).is_some());
+        // Straddling the edge: only the part on the main display is captured.
+        let edge = mac_raw_context("com.apple.textedit".into(), "a.txt".into(), None, Some((1100.0, 100.0, 800.0, 600.0)));
+        assert_eq!(build_context(&edge, None, MW, MH).region, Region { x: 1100, y: 100, w: 412, h: 600 });
+    }
+
+    #[test]
+    fn mac_sensitive_apps_are_refused_by_bundle_id() {
+        for key in ["com.1password.1password", "com.agilebits.onepassword7", "com.apple.keychainaccess", "com.apple.passwords"] {
+            let raw = mac_raw_context(key.into(), "Vault".into(), None, Some((10.0, 40.0, 900.0, 700.0)));
+            let ctx = build_context(&raw, None, MW, MH);
+            assert!(ctx.sensitive, "{key}");
+            assert!(capture_block_reason(&ctx).is_some(), "{key}");
+        }
+        let bank = mac_raw_context(
+            "com.apple.safari".into(),
+            "Example".into(),
+            Some("https://www.paypal.com/myaccount".into()),
+            Some((10.0, 40.0, 900.0, 700.0)),
+        );
+        assert!(build_context(&bank, None, MW, MH).sensitive);
+    }
+
+    #[test]
+    fn mac_browser_families() {
+        for (key, want) in [
+            ("com.google.chrome", Some(MacBrowser::Chromium)),
+            ("com.brave.browser", Some(MacBrowser::Chromium)),
+            ("com.microsoft.edgemac", Some(MacBrowser::Chromium)),
+            ("company.thebrowser.browser", Some(MacBrowser::Chromium)),
+            ("com.apple.Safari", Some(MacBrowser::Safari)),
+            ("org.mozilla.firefox", Some(MacBrowser::Firefox)),
+            ("com.apple.textedit", None),
+            ("chrome.exe", None),
+            ("", None),
+        ] {
+            assert_eq!(mac_browser(key), want, "{key}");
+        }
+    }
+
+    #[test]
+    fn mac_page_url_keeps_only_web_addresses() {
+        assert_eq!(mac_page_url("https://example.com/a?b=1\n").as_deref(), Some("https://example.com/a?b=1"));
+        assert_eq!(mac_page_url("HTTP://Example.com").as_deref(), Some("HTTP://Example.com"));
+        for bad in ["", "favorites://", "about:blank", "file:///Users/me/notes.txt", "missing value",
+                    "execution error: Not authorized to send Apple events (-1743)", "https://a.com/x y"] {
+            assert_eq!(mac_page_url(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn mac_url_script_asks_only_the_front_browser_by_its_own_id() {
+        assert_eq!(
+            mac_url_script(MacBrowser::Chromium, "com.google.Chrome").as_deref(),
+            Some("tell application id \"com.google.Chrome\" to return URL of active tab of front window")
+        );
+        assert_eq!(
+            mac_url_script(MacBrowser::Safari, "com.apple.Safari").as_deref(),
+            Some("tell application id \"com.apple.Safari\" to return URL of current tab of front window")
+        );
+        assert_eq!(mac_url_script(MacBrowser::Firefox, "org.mozilla.firefox"), None);
+        // The id is script text: anything but a plain bundle id is refused.
+        for bad in ["", "com.evil\" to do shell script \"x", "com.google.chrome\nend", "com google"] {
+            assert_eq!(mac_url_script(MacBrowser::Chromium, bad), None, "{bad:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_browser_window_is_a_page_cropped_below_the_toolbar() {
+        let raw = mac_raw_context(
+            "com.google.chrome".into(),
+            "Top 10 healthiest nuts | Women's Health".into(),
+            Some("https://www.womenshealthmag.com/uk/food/?utm_source=x".into()),
+            Some((0.0, 37.0, 1512.0, 945.0)),
+        );
+        let ctx = build_context(&raw, None, MW, MH);
+        assert_eq!(ctx.kind, ContentKind::BrowserPage);
+        let inset = toolbar_inset(945);
+        assert_eq!(ctx.region, Region { x: 0, y: 37 + inset, w: 1512, h: 945 - inset });
+        assert_eq!(capture_block_reason(&ctx), None);
+        let block = ctx.prompt_block();
+        assert!(block.contains("App: com.google.chrome"));
+        assert!(block.contains("https://www.womenshealthmag.com/uk/food") && !block.contains("utm_source"));
+
+        let video = mac_raw_context(
+            "com.apple.safari".into(),
+            "Some Video - YouTube".into(),
+            Some(format!("https://www.youtube.com/watch?v={ID}&list=PLsecret")),
+            Some((0.0, 37.0, 1512.0, 945.0)),
+        );
+        assert_eq!(build_context(&video, None, MW, MH).kind, ContentKind::Video);
+
+        // A browser whose URL could not be read is still capturable.
+        let no_url = mac_raw_context("org.mozilla.firefox".into(), "Mozilla Firefox".into(), None, Some((0.0, 37.0, 1512.0, 945.0)));
+        let ctx = build_context(&no_url, None, MW, MH);
+        assert_eq!(ctx.kind, ContentKind::BrowserPage);
+        assert_eq!(capture_block_reason(&ctx), None);
+        assert!(ctx.prompt_block().contains("not exposed by the browser"));
+    }
+
+    #[test]
+    fn mac_recheck_catches_a_new_tab_a_moved_window_or_another_app() {
+        let frame = Some((0.0, 37.0, 1512.0, 945.0));
+        let url = Some("https://example.com/".to_string());
+        let expected = build_context(
+            &mac_raw_context("com.google.chrome".into(), "Example".into(), url.clone(), frame),
+            None, MW, MH,
+        );
+        let again = build_context(
+            &mac_raw_context("com.google.chrome".into(), "Example".into(), url.clone(), frame),
+            None, MW, MH,
+        );
+        assert!(same_capture_target(&expected, &again));
+        let changes = [
+            mac_raw_context("com.google.chrome".into(), "Other tab".into(), Some("https://example.com/other".into()), frame),
+            mac_raw_context("com.google.chrome".into(), "Example".into(), url.clone(), Some((40.0, 37.0, 1200.0, 900.0))),
+            mac_raw_context("com.apple.safari".into(), "Example".into(), url, frame),
+        ];
+        for raw in changes {
+            assert!(!same_capture_target(&expected, &build_context(&raw, None, MW, MH)), "{raw:?}");
+        }
     }
 }

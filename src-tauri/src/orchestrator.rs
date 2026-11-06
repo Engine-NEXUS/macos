@@ -990,6 +990,14 @@ pub async fn process_transcript<R: Runtime>(
         }
         let (request_id, _) = install_new_request(Subsystem::LocalCommand);
         let reply = match question {
+            // macOS reads the foreground window through the Accessibility API: without it the probe is empty, and
+            // the user should hear where to grant it rather than "try again".
+            #[cfg(target_os = "macos")]
+            DeviceQuestion::ForegroundApp | DeviceQuestion::ForegroundRepo
+                if !crate::mac_permissions::accessibility_trusted() =>
+            {
+                crate::mac_permissions::ACCESSIBILITY_LINE.to_string()
+            }
             DeviceQuestion::ForegroundApp | DeviceQuestion::ForegroundRepo => {
                 let (sw, sh) = crate::screen::primary_monitor_size().unwrap_or((1920, 1080));
                 let target = crate::screen_context::collect_target(sw, sh).await;
@@ -2228,7 +2236,7 @@ pub async fn process_transcript<R: Runtime>(
                             None => {
                                 // No repository page is open: the repository may only be NAMED on screen (an email, a
                                 // notification). Read the names off the screen and find them in the user's GitHub.
-                                #[cfg(target_os = "windows")]
+                                #[cfg(any(target_os = "windows", target_os = "macos"))]
                                 let names: Vec<String> = read_screen_json(
                                     &app,
                                     crate::repo_hint::build_prompt(),
@@ -2237,7 +2245,7 @@ pub async fn process_transcript<R: Runtime>(
                                 )
                                 .await
                                 .unwrap_or_default();
-                                #[cfg(not(target_os = "windows"))]
+                                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                                 let names: Vec<String> = Vec::new();
                                 match resolve_screen_repos(&names).await {
                                     ScreenRepo::One(o, r) => worker_transcript = format!("analyse {o}/{r}"),
@@ -4419,11 +4427,7 @@ async fn run_screen_click<R: Runtime>(
                     Err(e) => speak_line(&app, format!("Couldn't click, sir: {e}"), &request_id),
                 }
             }
-            None => speak_line(
-                &app,
-                format!("I only see {} clickable things, sir.", els.len()),
-                &request_id,
-            ),
+            None => speak_line(&app, too_few_controls_line(els.len()), &request_id),
         }
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -4489,11 +4493,7 @@ async fn run_screen_read<R: Runtime>(
                 format!("{} {} says {}, sir.", ordinal_word(ordinal), el.kind, el.name),
                 &request_id,
             ),
-            None => speak_line(
-                &app,
-                format!("I only see {} clickable things, sir.", els.len()),
-                &request_id,
-            ),
+            None => speak_line(&app, too_few_controls_line(els.len()), &request_id),
         }
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -4507,6 +4507,24 @@ async fn run_screen_read<R: Runtime>(
         subsystem: Subsystem::LocalCommand,
         handled_locally: true,
     })
+}
+
+/// Spoken when the asked-for control number is past the end of the on-screen
+/// list. On macOS an empty list while Accessibility is missing means NEXUS
+/// cannot read the controls at all, so the user hears where to grant it.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn too_few_controls_line(found: usize) -> String {
+    #[cfg(target_os = "macos")]
+    if mac_controls_unreadable(found, crate::mac_permissions::accessibility_trusted()) {
+        return crate::mac_permissions::ACCESSIBILITY_LINE.to_string();
+    }
+    format!("I only see {found} clickable things, sir.")
+}
+
+/// macOS: no controls listed and no Accessibility permission. Pure.
+#[cfg(any(target_os = "macos", test))]
+fn mac_controls_unreadable(found: usize, accessibility_trusted: bool) -> bool {
+    found == 0 && !accessibility_trusted
 }
 
 fn ordinal_word(n: u32) -> String {
@@ -4564,14 +4582,15 @@ pub fn screen_query_wants_ocr(prompt: &str) -> bool {
 }
 
 /// LOCAL OCR answer attempt (Feature 86, zero-RAM, keyless+offline).
-/// Runs Windows.Media.Ocr on a blocking thread (WinRT async), speaks a
+/// Runs Windows.Media.Ocr (macOS: the Vision framework, `crate::ocr`) on a
+/// blocking thread, speaks a
 /// text summary, and shows the extracted text in the assistant panel via
 /// the race-free pending pattern. `prompt` is the raw transcript (used as
 /// the pending query so the copy/title gating keys off the real words).
 ///
 /// Returns Some(ProcessResult) when OCR produced text (turn answered +
 /// cleared); None when OCR found nothing → caller continues the chain.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn try_ocr_answer<R: Runtime>(
     app: &AppHandle<R>,
     prompt: &str,
@@ -4689,7 +4708,7 @@ pub fn ocr_spoken_summary(text: &str) -> String {
 /// least 60 chars asks the text router to answer the user's actual question
 /// from that text. Spoken + sidebar card (answer + raw OCR). Returns None
 /// (→ caller continues the chain) on any failure; never panics.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn explain_screen_text<R: Runtime>(
     app: &AppHandle<R>,
     prompt: &str,
@@ -4925,7 +4944,7 @@ async fn show_sidebar_spatial<R: Runtime>(app: &AppHandle<R>, payload: &serde_js
     crate::commands::emit_logged(app, "sidebar:show_spatial", payload.clone());
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn run_screen_tour<R: Runtime>(
     app: &AppHandle<R>,
     prompt: &str,
@@ -5214,7 +5233,7 @@ async fn run_screen_tour<R: Runtime>(
 /// Narrate one validated script with synced callouts: `screen:tour_start`, then line i audible <=>
 /// callout i shown, then `screen:tour_end`. Shared by the screen tour and the reverse-engineer
 /// scroll tour (one call per page viewport). Returns why it ended (done / cancelled).
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) async fn narrate_tour_script<R: Runtime>(
     app: &AppHandle<R>,
     rid: &str,
@@ -6119,7 +6138,7 @@ async fn gather_screen_prs<R: Runtime>(app: &AppHandle<R>, url: Option<&str>) ->
         }
     }
     if !out.iter().any(|(s, _)| s.number.is_some()) {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let seen = read_screen_json(app, crate::pr_screen::build_prompt(), 400, |t| Some(crate::pr_screen::parse_prs(t)))
                 .await
@@ -6128,7 +6147,7 @@ async fn gather_screen_prs<R: Runtime>(app: &AppHandle<R>, url: Option<&str>) ->
                 add(s, false, &mut out);
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let _ = app;
     }
     out
@@ -6331,7 +6350,7 @@ pub(crate) async fn resolve_screen_repos(names: &[String]) -> ScreenRepo {
 
 /// Freeze the foreground window (sensitive ones refused), capture it and ask the vision model for JSON.
 /// `Err` carries a short spoken reason.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn read_screen_json<R: Runtime, T>(
     app: &AppHandle<R>,
     prompt: &str,
@@ -6341,6 +6360,10 @@ async fn read_screen_json<R: Runtime, T>(
     let key = crate::commands::read_api_key(app, "gemini");
     if key.is_empty() {
         return Err("I need a Gemini key to read the screen, sir.".into());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(line) = mac_screen_block_line() {
+        return Err(line.to_string());
     }
     let (sw, sh) = crate::screen::primary_monitor_size().ok_or("I couldn't identify the screen, sir.")?;
     let target = crate::screen_context::collect_target(sw, sh).await;
@@ -6470,15 +6493,19 @@ async fn run_place_info<R: Runtime>(app: AppHandle<R>, query: String, ask: Strin
 /// email names a venue, and speak one line.
 async fn run_analyse_this_email<R: Runtime>(app: AppHandle<R>) -> Result<ProcessResult, String> {
     let (request_id, _) = install_new_request(Subsystem::LocalCommand);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         return say_and_finish(&app, request_id, "Reading the open email is not verified on this platform yet, sir.".into());
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let key = crate::commands::read_api_key(&app, "gemini");
         if key.is_empty() {
             return say_and_finish(&app, request_id, "I need a Gemini key to read the email, sir. You can add one in the Command Hub.".into());
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(line) = mac_screen_block_line() {
+            return say_and_finish(&app, request_id, line.into());
         }
         let (sw, sh) = crate::screen::primary_monitor_size().ok_or("Could not identify the primary monitor")?;
         let target = crate::screen_context::collect_target(sw, sh).await;
@@ -6911,15 +6938,19 @@ async fn run_code_project<R: Runtime>(
 /// progressively and the completed record is sealed locally.
 async fn run_foreground_review<R: Runtime>(app: AppHandle<R>) -> Result<ProcessResult, String> {
     let (request_id, cancel_flag) = install_new_request(Subsystem::LocalCommand);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = cancel_flag;
         return say_and_finish(&app, request_id,
             "Foreground review is not verified on this platform yet, sir.".into());
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         use crate::foreground_review::{ReviewMeta, ReviewRecord};
+        #[cfg(target_os = "macos")]
+        if let Some(line) = mac_screen_block_line() {
+            return say_and_finish(&app, request_id, line.into());
+        }
         let (sw, sh) = crate::screen::primary_monitor_size()
             .ok_or("Could not identify the primary monitor")?;
         let target = crate::screen_context::collect_target(sw, sh).await;
@@ -8364,6 +8395,77 @@ async fn run_counsel_turn<R: Runtime>(
     }
 }
 
+/// What macOS still has to allow before NEXUS may look at the screen.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacScreenGate {
+    Ready,
+    NeedsScreenRecording,
+    NeedsAccessibility,
+}
+
+/// The pixels need Screen Recording: without it macOS returns a frame with the
+/// other apps' windows left out, which must never be analysed. The foreground
+/// window's identity and frame come from the Accessibility API. Screen
+/// Recording is named first because NEXUS can raise macOS's own prompt for it.
+/// Pure.
+#[cfg(any(target_os = "macos", test))]
+fn mac_screen_gate(screen_recording: bool, accessibility: bool) -> MacScreenGate {
+    if !screen_recording {
+        MacScreenGate::NeedsScreenRecording
+    } else if !accessibility {
+        MacScreenGate::NeedsAccessibility
+    } else {
+        MacScreenGate::Ready
+    }
+}
+
+/// macOS: the line to speak when a screen read cannot start, None when it can.
+/// A missing Screen Recording permission also asks macOS to show its prompt
+/// (once per call).
+#[cfg(target_os = "macos")]
+fn mac_screen_block_line() -> Option<&'static str> {
+    use crate::mac_permissions as perm;
+    match mac_screen_gate(perm::screen_recording_allowed(), perm::accessibility_trusted()) {
+        MacScreenGate::Ready => None,
+        MacScreenGate::NeedsScreenRecording => {
+            perm::request_screen_recording();
+            Some(perm::SCREEN_RECORDING_LINE)
+        }
+        MacScreenGate::NeedsAccessibility => Some(perm::ACCESSIBILITY_LINE),
+    }
+}
+
+/// Stage pins are physical pixels (the stage frontend divides them by
+/// `devicePixelRatio`). Windows capture regions already are; macOS regions are
+/// points, so every coordinate is multiplied by the display's backing scale.
+/// Pure.
+#[cfg(any(target_os = "macos", test))]
+fn scale_stage_pins(pins: Vec<serde_json::Value>, scale: f64) -> Vec<serde_json::Value> {
+    const COORDS: [&str; 6] = ["x", "y", "width", "height", "pin_x", "pin_y"];
+    pins.into_iter()
+        .map(|mut pin| {
+            for key in COORDS {
+                if let Some(v) = pin.get(key).and_then(serde_json::Value::as_f64) {
+                    pin[key] = serde_json::json!((v * scale).round() as i64);
+                }
+            }
+            pin
+        })
+        .collect()
+}
+
+/// Backing scale of the main display (2 on Retina), 1 when it cannot be read.
+#[cfg(target_os = "macos")]
+fn main_display_scale<R: Runtime>(app: &AppHandle<R>) -> f64 {
+    app.primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.scale_factor())
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(1.0)
+}
+
 /// Analyze screen contents (Feature 86 spatial flow): Gemini-primary
 /// spatial decomposition → stage overlay pins + sidebar SpatialDashboard.
 /// Graceful degradation chain: spatial VLM → plain-text VLM → UIA count.
@@ -8377,7 +8479,11 @@ async fn run_screen_analysis<R: Runtime>(
     prompt: String,
 ) -> Result<ProcessResult, String> {
     let (request_id, cancel_flag) = install_new_request(Subsystem::LocalCommand);
-    #[cfg(target_os = "windows")]
+    #[cfg(target_os = "macos")]
+    if let Some(line) = mac_screen_block_line() {
+        return say_and_finish(&app, request_id, line.into());
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let capture_target = {
         let (sw, sh) = crate::screen::primary_monitor_size().unwrap_or((1920, 1080));
         let ctx = crate::screen_context::collect_target(sw, sh).await;
@@ -8394,7 +8500,7 @@ async fn run_screen_analysis<R: Runtime>(
     };
     #[allow(unused_mut)]
     let mut tour_acked = false;
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         if crate::screen_tour::tour_enabled(&app)
             && crate::screen_tour::wants_narrated_tour(&prompt)
@@ -8416,7 +8522,7 @@ async fn run_screen_analysis<R: Runtime>(
             }
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let _ = &cancel_flag;
     if !tour_acked {
         speak_line(&app, "Analyzing the screen, sir.".to_string(), &request_id);
@@ -8426,14 +8532,14 @@ async fn run_screen_analysis<R: Runtime>(
     // (Initialised for the paths that reach the fallbacks without the spatial
     // attempt failing; the spatial `Ok` arm returns, so the compiler can't see
     // a read of the initial value.)
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[allow(unused_assignments)]
     let mut downgrade_reason: Option<&'static str> = None;
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[allow(unused_assignments)]
     let mut skip_plain_text = false;
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let (sw, sh) = crate::screen::primary_monitor_size().unwrap_or((1920, 1080));
         if !crate::screen_context::foreground_still_matches(&capture_target, sw, sh).await {
@@ -8520,6 +8626,8 @@ async fn run_screen_analysis<R: Runtime>(
                         })
                     })
                     .collect::<Vec<_>>();
+                #[cfg(target_os = "macos")]
+                let pins = scale_stage_pins(pins, main_display_scale(&app));
                 crate::commands::emit_logged(
                     &app,
                     "stage:spatial_annotations",
@@ -8644,7 +8752,7 @@ async fn run_screen_analysis<R: Runtime>(
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = prompt;
         speak_line(&app, "Screen analysis needs Windows, sir.".to_string(), &request_id);
@@ -8654,7 +8762,7 @@ async fn run_screen_analysis<R: Runtime>(
     // Windows.Media.Ocr extracts the visible text; the user gets a real
     // answer (spoken summary + extracted text in the sidebar) with zero
     // API keys and zero network.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         if let Some(result) = try_ocr_answer(&app, &prompt, &request_id, &capture_target, downgrade_reason).await {
             return Ok(result);
@@ -9074,6 +9182,13 @@ async fn run_click_element<R: Runtime>(app: AppHandle<R>, name: String) -> Resul
         speak_line(&app, "Which button or element should I click, sir?".to_string(), &request_id);
         clear_active_request(&request_id);
         return Ok(ProcessResult { request_id, subsystem: Subsystem::LocalCommand, handled_locally: true });
+    }
+    // macOS: both the name lookup (the control list) and the click itself go through Accessibility. Without it the
+    // list is empty and a vision match could not be clicked either, so say where to grant it instead of
+    // "Couldn't find".
+    #[cfg(target_os = "macos")]
+    if !crate::mac_permissions::accessibility_trusted() {
+        return say_and_finish(&app, request_id, crate::mac_permissions::ACCESSIBILITY_LINE.into());
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -11840,5 +11955,41 @@ mod loading_hide_scope_tests {
     #[test]
     fn with_no_active_request_a_hide_is_harmless_and_applies() {
         assert!(loading_hide_applies(None, "a1"));
+    }
+}
+
+#[cfg(test)]
+mod mac_screen_tests {
+    use super::{mac_controls_unreadable, mac_screen_gate, scale_stage_pins, MacScreenGate};
+
+    #[test]
+    fn screen_recording_is_asked_for_first_then_accessibility() {
+        assert_eq!(mac_screen_gate(false, false), MacScreenGate::NeedsScreenRecording);
+        assert_eq!(mac_screen_gate(false, true), MacScreenGate::NeedsScreenRecording);
+        assert_eq!(mac_screen_gate(true, false), MacScreenGate::NeedsAccessibility);
+        assert_eq!(mac_screen_gate(true, true), MacScreenGate::Ready);
+    }
+
+    #[test]
+    fn only_an_empty_list_without_accessibility_names_the_permission() {
+        assert!(mac_controls_unreadable(0, false));
+        assert!(!mac_controls_unreadable(0, true)); // trusted, the window really has none
+        assert!(!mac_controls_unreadable(3, false));
+    }
+
+    #[test]
+    fn stage_pins_in_points_become_physical_pixels() {
+        let pins = vec![serde_json::json!({
+            "id": 1, "label": "Logo",
+            "x": 100, "y": 50, "width": 30, "height": 21, "pin_x": 101, "pin_y": 49,
+        })];
+        let out = scale_stage_pins(pins.clone(), 2.0);
+        assert_eq!(out[0], serde_json::json!({
+            "id": 1, "label": "Logo",
+            "x": 200, "y": 100, "width": 60, "height": 42, "pin_x": 202, "pin_y": 98,
+        }));
+        // A non-Retina display leaves the pins as they are.
+        assert_eq!(scale_stage_pins(pins, 1.0)[0]["x"], 100);
+        assert_eq!(scale_stage_pins(vec![serde_json::json!({"x": 3})], 1.5)[0]["x"], 5); // 4.5 rounds away from zero
     }
 }
