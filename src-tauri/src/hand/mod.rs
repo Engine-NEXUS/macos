@@ -328,6 +328,11 @@ fn guard_now() -> Option<String> {
     }
     let title = crate::browser_url::foreground_window_title().unwrap_or_default();
     let process = crate::browser_url::foreground_process_name().unwrap_or_default();
+    // Fail closed: until macOS foreground-app detection exists (doc 155, M6/M7) both reads are empty, and an empty
+    // title/process would sail past the protected-window denylist. Hand Mode stays in preview instead.
+    if title.is_empty() && process.is_empty() {
+        return Some("cannot identify the foreground app on this Mac yet".to_string());
+    }
     guard_decision(&title, &process, false, false)
 }
 

@@ -3,7 +3,7 @@
 //! thin so the tested logic is the logic that ships.
 
 use super::keys::{key_events, Chord, KeyEvent};
-use super::map::{Action, SEED};
+use super::map::{active_seed, Action};
 use super::router::{self, Env, Foreground, Outcome};
 
 /// Credential managers and wallets: protected even when only the *window title* says so
@@ -44,7 +44,16 @@ impl Env for WinEnv {
             let elevated = crate::live::commands::window::window_process_elevated(hwnd);
             Some(Foreground { exe, title, hwnd: hwnd.0, elevated })
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            // Bundle id is the map key (what seed_macos.json lists); the pid doubles as the window identity
+            // so the router's "same window before sending" check still works. A Mac app cannot be "elevated"
+            // in the Windows sense.
+            let app = crate::macos_foreground::front_app()?;
+            let title = crate::macos_foreground::window_title(app.pid).unwrap_or_default();
+            Some(Foreground { exe: app.key(), title, hwnd: app.pid as isize, elevated: false })
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             None
         }
@@ -126,7 +135,7 @@ pub fn send_events(events: &[KeyEvent]) -> Result<(), String> {
     }
 }
 
-/// One chord on macOS = the same down/up sequence sent through enigo's `Key::Raw`,
+/// One chord on macOS = the same down/up sequence sent through enigo's `Keyboard::raw`,
 /// which posts CGEvents with the platform's virtual key codes (Accessibility
 /// permission required; without it the OS silently drops the keys, so callers'
 /// verification steps still catch a failed press).
@@ -223,7 +232,7 @@ fn vk_to_mac(vk: u16) -> Option<u16> {
 
 #[cfg(target_os = "macos")]
 pub fn send_events(events: &[KeyEvent]) -> Result<(), String> {
-    use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+    use enigo::{Direction, Enigo, Keyboard, Settings};
     if events.is_empty() {
         return Ok(());
     }
@@ -232,7 +241,8 @@ pub fn send_events(events: &[KeyEvent]) -> Result<(), String> {
         let code = vk_to_mac(ev.vk)
             .ok_or_else(|| format!("virtual key 0x{:02X} has no macOS mapping yet", ev.vk))?;
         let dir = if ev.up { Direction::Release } else { Direction::Press };
-        e.key(Key::Raw(code), dir).map_err(|err| err.to_string())?;
+        // enigo 0.5 removed `Key::Raw`; `Keyboard::raw` posts the CGKeyCode and tracks modifier flags itself.
+        e.raw(code, dir).map_err(|err| err.to_string())?;
     }
     Ok(())
 }
@@ -250,7 +260,7 @@ pub fn send_events(_events: &[KeyEvent]) -> Result<(), String> {
 /// Perform `action` in the application that is in front right now. Blocking (≤ ~0.8 s when it verifies a
 /// title change, a few ms otherwise): call from a blocking context, not from a latency-critical async task.
 pub fn do_action(action: Action, arg: Option<u32>) -> Outcome {
-    let out = router::run(&WinEnv, &SEED, action, arg);
+    let out = router::run(&WinEnv, active_seed(), action, arg);
     log_outcome(action, arg, &out);
     out
 }
@@ -365,6 +375,14 @@ mod tests {
         assert!(!is_protected_window("brave.exe", "Memory Bank notes - Brave"));
         assert!(!is_protected_window("chrome.exe", "Ledger of expenses - Google Sheets"));
         assert!(!is_protected_window("notepad.exe", "Untitled - Notepad"));
+        // macOS: the exe slot carries the bundle id.
+        assert!(is_protected_window("com.1password.1password", ""));
+        assert!(is_protected_window("com.agilebits.onepassword7", ""));
+        assert!(is_protected_window("com.bitwarden.desktop", ""));
+        assert!(is_protected_window("com.apple.keychainaccess", ""));
+        assert!(is_protected_window("com.apple.passwords", ""));
+        assert!(!is_protected_window("com.apple.textedit", "Untitled"));
+        assert!(!is_protected_window("com.google.chrome", "News - Google Chrome"));
     }
 
     #[test]
@@ -377,6 +395,34 @@ mod tests {
 
     // macOS key translation: CI-verified on the aarch64 runner (the table is
     // cfg'd out on Windows builds, where CG codes are meaningless).
+    /// Every chord the macOS seed can send must be translatable, or the router would pass validation and then
+    /// fail at send time with "unmapped key". Runs only on macOS (where `vk_to_mac` exists).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_macos_seed_chord_translates_to_mac_key_codes() {
+        use super::super::keys::parse_chord;
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("seed_macos.json")).expect("valid json");
+        let mut checked = 0;
+        for (_scope, table) in v["bindings"].as_object().expect("bindings") {
+            for (_action, val) in table.as_object().expect("table") {
+                let templates: Vec<&str> = match val {
+                    serde_json::Value::String(s) => vec![s.as_str()],
+                    serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_str()).collect(),
+                    _ => vec![],
+                };
+                for t in templates {
+                    let chord = parse_chord(&t.replace("{n}", "1")).expect("chord parses");
+                    for ev in key_events(&chord) {
+                        assert!(vk_to_mac(ev.vk).is_some(), "'{t}': key 0x{:02X} has no mac code", ev.vk);
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 40, "suspiciously few chords checked: {checked}");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn vk_to_mac_is_unique_and_exact_per_keys_rs_output() {

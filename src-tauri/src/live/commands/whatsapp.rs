@@ -38,7 +38,7 @@ pub fn search_contact(contact: &str) -> Result<(), String> {
     tracing::info!("live: searching whatsapp contact: {contact}");
 
     // Ctrl+F opens the search bar in WhatsApp Desktop
-    keyboard::press_hotkey(&["ctrl", "f"])?;
+    keyboard::press_shortcut(&["ctrl", "f"])?;
     thread::sleep(Duration::from_millis(500));
 
     // Type the contact name

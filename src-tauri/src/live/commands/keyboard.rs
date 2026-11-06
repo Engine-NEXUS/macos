@@ -145,6 +145,26 @@ pub fn press_hotkey(keys: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// The "primary modifier" spelled Windows-style (`ctrl`) becomes Command on a Mac: Ctrl+C / Ctrl+T / Ctrl+L are
+/// Cmd+C / Cmd+T / Cmd+L there. Pure so it is testable on any OS; with `macos == false` the keys come back unchanged.
+/// Only for NEXUS's own shortcuts; a user who says "press control c" gets exactly what they said (`press_hotkey`).
+fn platform_keys(keys: &[&str], macos: bool) -> Vec<String> {
+    keys.iter()
+        .map(|k| match k.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" if macos => "cmd".to_string(),
+            _ => (*k).to_string(),
+        })
+        .collect()
+}
+
+/// A shortcut NEXUS itself needs (new tab, address bar, find, undo…), written with `ctrl` and sent as the
+/// platform's primary modifier. On Windows and Linux this is exactly `press_hotkey`.
+pub fn press_shortcut(keys: &[&str]) -> Result<(), String> {
+    let mapped = platform_keys(keys, cfg!(target_os = "macos"));
+    let refs: Vec<&str> = mapped.iter().map(String::as_str).collect();
+    press_hotkey(&refs)
+}
+
 /// Map a string key name to an enigo Key.
 /// Inspired by OpenDex's `keyFromToken()` in computer/skill.ts.
 fn parse_key(token: &str) -> Option<Key> {
@@ -268,5 +288,17 @@ mod tests {
         assert_eq!(parse_key("unknown"), None);
         assert_eq!(parse_key("xyz"), None);
         assert_eq!(parse_key(""), None);
+    }
+
+    #[test]
+    fn platform_keys_maps_ctrl_to_cmd_only_on_macos() {
+        assert_eq!(platform_keys(&["ctrl", "t"], true), vec!["cmd", "t"]);
+        assert_eq!(platform_keys(&["Control", "shift", "t"], true), vec!["cmd", "shift", "t"]);
+        // Windows / Linux: untouched, byte for byte.
+        assert_eq!(platform_keys(&["ctrl", "t"], false), vec!["ctrl", "t"]);
+        assert_eq!(platform_keys(&["ctrl", "shift", "tab"], false), vec!["ctrl", "shift", "tab"]);
+        // Everything that is not the primary modifier is left alone on a Mac too.
+        assert_eq!(platform_keys(&["alt", "left"], true), vec!["alt", "left"]);
+        assert_eq!(platform_keys(&["escape"], true), vec!["escape"]);
     }
 }

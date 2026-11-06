@@ -1779,7 +1779,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             for (status, headers, body, location) in handles {
-                let (stream, _) = listener.accept().await.unwrap();
+                let (mut stream, _) = listener.accept().await.unwrap();
                 let mut buf = vec![0u8; 65536];
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(10), stream.readable()).await;
                 let n = stream.try_read(&mut buf).unwrap_or(0);
@@ -1790,7 +1790,11 @@ mod tests {
                 }
                 resp_headers.extend(headers);
                 let out = response_bytes(status, &resp_headers, &body);
-                let _ = stream.try_write(&out);
+                // `try_write` is non-blocking and writes only what fits in the socket buffer (much less on macOS than on
+                // Windows), which cut the 5 MB test response short. `write_all` sends all of it.
+                use tokio::io::AsyncWriteExt;
+                let _ = stream.write_all(&out).await;
+                let _ = stream.shutdown().await;
                 drop(stream);
             }
         });

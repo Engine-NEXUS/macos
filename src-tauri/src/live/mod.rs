@@ -471,9 +471,17 @@ pub async fn live_ghost_click<R: tauri::Runtime>(
     if app_title.trim().is_empty() || element.trim().is_empty() {
         return Ok(LiveResult::err("ghost click: app and element required"));
     }
-    match commands::mouse::ghost_click(app, &app_title, &element).await {
-        Ok(msg) => Ok(LiveResult::ok(msg)),
-        Err(e) => Ok(LiveResult::err(e)),
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        return Ok(LiveResult::err("ghost click is Windows-only for now"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match commands::mouse::ghost_click(app, &app_title, &element).await {
+            Ok(msg) => Ok(LiveResult::ok(msg)),
+            Err(e) => Ok(LiveResult::err(e)),
+        }
     }
 }
 

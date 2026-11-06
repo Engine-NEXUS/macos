@@ -488,10 +488,24 @@ pub(crate) fn foreground_window_title() -> Option<String> {
     get_foreground_window_title()
 }
 
-/// macOS/Linux: NSWorkspace + AX title reads land with the Phase 1 port.
-#[cfg(not(target_os = "windows"))]
+/// macOS: the front window's title via System Events (needs the user's Automation permission; None without it, so
+/// callers fall back to the bundle id). Linux: not implemented.
+#[cfg(target_os = "macos")]
+pub(crate) fn foreground_window_title() -> Option<String> {
+    let app = crate::macos_foreground::front_app()?;
+    crate::macos_foreground::window_title(app.pid)
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub(crate) fn foreground_window_title() -> Option<String> {
     None
+}
+
+/// macOS: the frontmost app's lower-case bundle id (e.g. `com.google.chrome`), the counterpart of `brave.exe`. `None`
+/// means "unknown", and every safety caller must treat unknown as "refuse" (see `hand::guard_now`).
+#[cfg(target_os = "macos")]
+pub(crate) fn foreground_process_name() -> Option<String> {
+    crate::macos_foreground::front_app().map(|a| a.key())
 }
 
 /// Foreground process executable name, lower-case (e.g. `brave.exe`).

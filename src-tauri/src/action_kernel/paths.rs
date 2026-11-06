@@ -238,8 +238,9 @@ mod tests {
         assert!(is_root(Path::new(r"C:\")));
         assert!(is_root(Path::new(r"D:")) || cfg!(not(windows)));
         assert!(!is_root(Path::new(r"C:\Users")));
-        assert!(has_component(Path::new(r"D:\p\.GIT\config"), &[".git"]));
-        assert!(!has_component(Path::new(r"D:\p\gitlab\config"), &[".git"]));
+        // forward slashes: they separate components on Windows AND on macOS/Linux (a backslash path is one component there)
+        assert!(has_component(Path::new("D:/p/.GIT/config"), &[".git"]));
+        assert!(!has_component(Path::new("D:/p/gitlab/config"), &[".git"]));
     }
 
     #[cfg(windows)]

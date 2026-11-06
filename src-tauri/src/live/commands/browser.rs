@@ -19,7 +19,7 @@ pub fn new_tab() -> Result<(), String> {
     // Shortcut brain (E1): gated + verified. When the title changed the tab demonstrably exists, so the
     // fixed settle wait is only kept for the unverified / legacy cases.
     match crate::shortcuts::run_or_legacy(crate::shortcuts::Action::NewTab, None, || {
-        keyboard::press_hotkey(&["ctrl", "t"])
+        keyboard::press_shortcut(&["ctrl", "t"])
     })? {
         crate::shortcuts::Sent::Router(crate::shortcuts::router::Verified::Yes) => {}
         _ => thread::sleep(Duration::from_millis(300)),
@@ -30,7 +30,7 @@ pub fn new_tab() -> Result<(), String> {
 /// Focus the address bar (Ctrl+L) through the shortcut brain, or the legacy hotkey for unknown apps.
 fn address_bar_hotkey() -> Result<(), String> {
     crate::shortcuts::run_or_legacy(crate::shortcuts::Action::AddressBar, None, || {
-        keyboard::press_hotkey(&["ctrl", "l"])
+        keyboard::press_shortcut(&["ctrl", "l"])
     })
     .map(|_| ())
 }

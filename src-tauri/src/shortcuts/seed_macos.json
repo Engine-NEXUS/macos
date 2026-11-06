@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "_comment": "macOS counterpart of seed_windows.json (docs/features/155, 156). Same schema and the same action vocabulary, but chords use Cmd where Windows uses Ctrl, and apps are identified by their lower-case BUNDLE ID (what lsappinfo reports) instead of an .exe name. Only shortcuts that are documented defaults of the named app are listed; an action an app has no default for is left out on purpose, so the router says 'no shortcut' instead of sending a wrong key. Safari is its own family because Cmd+1..9 means 'open favourite N' there unless a setting is changed. Arc is not listed: its Cmd+T and Ctrl+Tab do different things. Terminals never inherit the global table (no_global). Values: one chord, or an array of alternatives (first is sent). '{n}' is the tab number 1-9.",
+  "families": {
+    "browser": {
+      "exes": [
+        "com.google.chrome",
+        "com.google.chrome.canary",
+        "com.brave.browser",
+        "com.microsoft.edgemac",
+        "org.mozilla.firefox",
+        "com.operasoftware.opera",
+        "com.vivaldi.vivaldi"
+      ]
+    },
+    "safari": {
+      "exes": ["com.apple.safari"]
+    },
+    "vscode": {
+      "exes": ["com.microsoft.vscode", "com.microsoft.vscodeinsiders"]
+    },
+    "finder": {
+      "exes": ["com.apple.finder"]
+    },
+    "textedit": {
+      "exes": ["com.apple.textedit"]
+    },
+    "terminal": {
+      "exes": ["com.apple.terminal", "com.googlecode.iterm2"],
+      "no_global": true
+    }
+  },
+  "bindings": {
+    "*": {
+      "copy": "Cmd+C",
+      "cut": "Cmd+X",
+      "paste": "Cmd+V",
+      "undo": "Cmd+Z",
+      "redo": "Cmd+Shift+Z",
+      "select_all": "Cmd+A",
+      "save": "Cmd+S",
+      "find_in_page": "Cmd+F",
+      "scroll_down": "PageDown",
+      "scroll_up": "PageUp"
+    },
+    "browser": {
+      "new_tab": "Cmd+T",
+      "close_tab": "Cmd+W",
+      "reopen_tab": "Cmd+Shift+T",
+      "next_tab": "Ctrl+Tab",
+      "prev_tab": "Ctrl+Shift+Tab",
+      "goto_tab_n": "Cmd+{n}",
+      "refresh": "Cmd+R",
+      "go_back": "Cmd+[",
+      "go_forward": "Cmd+]",
+      "address_bar": "Cmd+L",
+      "zoom_in": "Cmd+=",
+      "zoom_out": "Cmd+-"
+    },
+    "safari": {
+      "new_tab": "Cmd+T",
+      "close_tab": "Cmd+W",
+      "reopen_tab": "Cmd+Shift+T",
+      "next_tab": "Ctrl+Tab",
+      "prev_tab": "Ctrl+Shift+Tab",
+      "refresh": "Cmd+R",
+      "go_back": "Cmd+[",
+      "go_forward": "Cmd+]",
+      "address_bar": "Cmd+L",
+      "zoom_in": "Cmd+=",
+      "zoom_out": "Cmd+-"
+    },
+    "vscode": {
+      "new_tab": "Cmd+N",
+      "close_tab": "Cmd+W",
+      "reopen_tab": "Cmd+Shift+T",
+      "goto_tab_n": "Ctrl+{n}",
+      "zoom_in": "Cmd+=",
+      "zoom_out": "Cmd+-"
+    },
+    "finder": {
+      "new_tab": "Cmd+T",
+      "close_tab": "Cmd+W",
+      "next_tab": "Ctrl+Tab",
+      "prev_tab": "Ctrl+Shift+Tab",
+      "go_back": "Cmd+[",
+      "go_forward": "Cmd+]",
+      "address_bar": "Cmd+Shift+G"
+    },
+    "textedit": {
+      "new_tab": "Cmd+N",
+      "close_tab": "Cmd+W"
+    },
+    "terminal": {
+      "new_tab": "Cmd+T",
+      "close_tab": "Cmd+W",
+      "next_tab": "Cmd+Shift+]",
+      "prev_tab": "Cmd+Shift+[",
+      "copy": "Cmd+C",
+      "paste": "Cmd+V",
+      "find_in_page": "Cmd+F",
+      "zoom_in": "Cmd+=",
+      "zoom_out": "Cmd+-"
+    }
+  }
+}

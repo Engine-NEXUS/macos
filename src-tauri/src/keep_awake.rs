@@ -507,14 +507,15 @@ mod tests {
     #[test]
     fn watchdog_does_not_clear_heartbeating_lease() {
         let fake = Fake::new();
-        // 80 ms watchdog timeout, 15 ms poll interval
-        let c = Controller::with_timing(fake.clone(), Duration::from_millis(80), Duration::from_millis(15));
+        // 400 ms watchdog timeout, 15 ms poll interval. These margins were 80 ms / 20 ms, which a loaded CI machine
+        // (a sleep(20) that takes 100 ms) turned into a flaky failure on macOS.
+        let c = Controller::with_timing(fake.clone(), Duration::from_millis(400), Duration::from_millis(15));
         let lease = c.acquire().expect("lease");
         assert!(*fake.live.lock().unwrap());
 
-        // Heartbeat every 20 ms for 160 ms (2x the watchdog timeout, well under 300 ms total).
-        for _ in 0..8 {
-            std::thread::sleep(Duration::from_millis(20));
+        // Heartbeat every 50 ms for 500 ms: longer than the watchdog timeout, but each gap is 8x shorter than it.
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(50));
             c.heartbeat();
         }
 

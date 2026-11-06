@@ -395,9 +395,40 @@ pub(crate) fn cursor_pos() -> Option<(i32, i32)> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn cursor_pos() -> Option<(i32, i32)> {
-    None
+/// Cursor position relative to the stage window's top-left, in physical pixels: the same space as the click regions the
+/// frontend registers (CSS px x devicePixelRatio). Pure so it is tested on every OS.
+///
+/// Used where there is no `GetCursorPos`: Tauri reports the cursor in desktop physical pixels, and subtracting the
+/// window origin removes any monitor offset, so a Retina display (2 physical px per point) needs no special case.
+#[cfg(any(not(target_os = "windows"), test))]
+fn window_relative(cursor: (f64, f64), origin: (i32, i32)) -> Option<(i32, i32)> {
+    if !cursor.0.is_finite() || !cursor.1.is_finite() {
+        return None;
+    }
+    let x = cursor.0 - f64::from(origin.0);
+    let y = cursor.1 - f64::from(origin.1);
+    // an absurd value would wrap in the integer cast; no real desktop is anywhere near this large
+    if x.abs() > 1.0e9 || y.abs() > 1.0e9 {
+        return None;
+    }
+    Some((x.round() as i32, y.round() as i32))
+}
+
+/// The cursor in the stage's coordinate space. Windows: `GetCursorPos`, exactly as before (the stage window sits at the
+/// primary monitor's origin). Elsewhere (macOS): Tauri's cursor position minus the window origin. This used to return
+/// `None` outside Windows, which kept the overlay permanently click-through, so no on-screen button could be clicked.
+fn stage_cursor<R: Runtime>(win: &tauri::WebviewWindow<R>) -> Option<(i32, i32)> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = win;
+        cursor_pos()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let cursor = win.cursor_position().ok()?;
+        let origin = win.outer_position().ok()?;
+        window_relative((cursor.x, cursor.y), (origin.x, origin.y))
+    }
 }
 
 /// Hitbox loop: adaptive cursor poll toggling click-through. Whole stage
@@ -442,7 +473,7 @@ pub fn spawn_hitbox_loop<R: Runtime>(app: AppHandle<R>) {
                     continue;
                 }
 
-                let pos = cursor_pos();
+                let pos = stage_cursor(&win);
                 if ghost_active {
                     crate::ghost::observe_cursor(crate::ghost::ghost_wry::g_wry_ref(&app), pos);
                 }
@@ -690,6 +721,32 @@ mod tests {
     fn test_hitbox_empty_never_inside() {
         let boxes: Vec<StageRect> = vec![];
         assert!(!boxes.iter().any(|r| r.contains(960, 540)));
+    }
+    #[test]
+    fn window_relative_removes_the_window_origin_and_rounds() {
+        assert_eq!(window_relative((100.4, 50.6), (0, 0)), Some((100, 51)));
+        // a stage window on a monitor to the LEFT of the primary has a negative origin
+        assert_eq!(window_relative((-1800.0, 10.0), (-1920, 0)), Some((120, 10)));
+        // a window offset below a menu bar
+        assert_eq!(window_relative((300.0, 124.0), (0, 24)), Some((300, 100)));
+        // not a number / absurd values never become a coordinate
+        assert_eq!(window_relative((f64::NAN, 1.0), (0, 0)), None);
+        assert_eq!(window_relative((1.0, f64::INFINITY), (0, 0)), None);
+        assert_eq!(window_relative((1.0e12, 1.0), (0, 0)), None);
+    }
+
+    #[test]
+    fn a_button_on_a_retina_screen_is_hit_in_physical_pixels() {
+        // CSS box (50, 40, 100x30) on a 2x display is registered by the frontend as physical (100, 80, 200x60).
+        let button = StageRect { x: 100, y: 80, w: 200, h: 60 };
+        // Tauri reports the cursor in physical px too, so the same space: inside...
+        let inside = window_relative((150.0, 100.0), (0, 0)).unwrap();
+        assert!(button.contains(inside.0, inside.1));
+        // ...and just outside (left of the button) is not
+        let outside = window_relative((99.0, 100.0), (0, 0)).unwrap();
+        assert!(!button.contains(outside.0, outside.1));
+        // Comparing a POINTS cursor against physical rects would have put the button at half its real position:
+        assert!(!button.contains(75, 50), "unscaled coordinates must not be mistaken for a hit");
     }
 }
 

@@ -10,6 +10,7 @@
 //! geometry stays consistent on Retina — physical pixels are folded into
 //! points here instead of multiplying the callers' coordinate math.
 
+use image::GenericImageView;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -34,12 +35,18 @@ pub(crate) fn primary_points() -> (i32, i32) {
 /// `"1920, 1080"` (osascript size output) → `(1920, 1080)`.
 fn parse_size_query(s: &str) -> Option<(i32, i32)> {
     let mut parts = s.split(',').map(|x| x.trim().parse::<f64>().ok());
-    let w = parts.next()?.and_then(|v| i32::try_from(v).ok())?;
-    let h = parts.next()?.and_then(|v| i32::try_from(v).ok())?;
+    let w = parts.next()?.and_then(dimension_to_i32)?;
+    let h = parts.next()?.and_then(dimension_to_i32)?;
     if w <= 0 || h <= 0 {
         return None;
     }
     Some((w, h))
+}
+
+/// A size read from osascript (`1440` or `1440.0`) as whole points. `i32::try_from(f64)` does not exist, so
+/// range-check and round explicitly; NaN / infinity / out-of-range values are rejected.
+fn dimension_to_i32(v: f64) -> Option<i32> {
+    (v.is_finite() && v >= f64::from(i32::MIN) && v <= f64::from(i32::MAX)).then(|| v.round() as i32)
 }
 
 /// BGRA of an on-screen rectangle in points. None when the permission is
@@ -89,7 +96,7 @@ fn rgba_to_bgra(rgba: &image::RgbaImage) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_size_query;
+    use super::{dimension_to_i32, parse_size_query};
 
     #[test]
     fn size_query_parses_osascript_output() {
@@ -97,5 +104,16 @@ mod tests {
         assert_eq!(parse_size_query("0, 0"), None);
         assert_eq!(parse_size_query(""), None);
         assert_eq!(parse_size_query("abc"), None);
+    }
+
+    #[test]
+    fn size_query_accepts_decimal_output_and_rejects_bad_numbers() {
+        assert_eq!(parse_size_query("1440.0, 900.0"), Some((1440, 900)));
+        assert_eq!(parse_size_query("1440.6, 899.4"), Some((1441, 899)));
+        assert_eq!(parse_size_query("-5, 900"), None);
+        assert_eq!(dimension_to_i32(f64::NAN), None);
+        assert_eq!(dimension_to_i32(f64::INFINITY), None);
+        assert_eq!(dimension_to_i32(1e12), None);
+        assert_eq!(dimension_to_i32(1920.0), Some(1920));
     }
 }

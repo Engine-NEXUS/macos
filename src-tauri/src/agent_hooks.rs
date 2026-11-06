@@ -2386,12 +2386,14 @@ mod tests {
 
     #[test]
     fn only_our_exact_old_commands_count_as_ours() {
-        for ok in [
-            r"C:\x\NEXUS-~1.CMD antigravity stop",
-            r"c:\x\nexus-agent-event.cmd antigravity start",
-            "C:/x/NEXUS-~2.cmd antigravity stop",
-        ] {
-            assert!(legacy_antigravity_command_is_ours(ok), "{ok}");
+        // the script's own name is `.cmd` on Windows and `.sh` elsewhere, so build that case from SCRIPT_NAME
+        let ok_cases = [
+            r"C:\x\NEXUS-~1.CMD antigravity stop".to_string(),
+            format!(r"c:\x\{SCRIPT_NAME} antigravity start"),
+            "C:/x/NEXUS-~2.cmd antigravity stop".to_string(),
+        ];
+        for ok in ok_cases {
+            assert!(legacy_antigravity_command_is_ours(&ok), "{ok}");
         }
         for bad in [
             r"C:\x\my-hook.cmd antigravity stop",

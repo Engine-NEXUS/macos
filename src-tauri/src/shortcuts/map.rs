@@ -205,6 +205,26 @@ pub static SEED: Lazy<ShortcutMap> = Lazy::new(|| match ShortcutMap::from_json(S
     }
 });
 
+static SEED_MACOS_JSON: &str = include_str!("seed_macos.json");
+
+/// The macOS map: Cmd chords, apps keyed by lower-case bundle id (docs/features/155, 156). Same fail-safe as `SEED`.
+pub static SEED_MACOS: Lazy<ShortcutMap> = Lazy::new(|| match ShortcutMap::from_json(SEED_MACOS_JSON) {
+    Ok(m) => m,
+    Err(e) => {
+        tracing::error!("[SHORTCUT] macOS seed failed to load ({e}) - shortcut brain disabled");
+        ShortcutMap::empty()
+    }
+});
+
+/// The map for the OS we are running on. On Windows and Linux this is exactly `SEED`.
+pub fn active_seed() -> &'static ShortcutMap {
+    if cfg!(target_os = "macos") {
+        &SEED_MACOS
+    } else {
+        &SEED
+    }
+}
+
 impl ShortcutMap {
     pub fn empty() -> Self {
         Self { exe_family: HashMap::new(), families: HashMap::new(), tables: HashMap::new() }
@@ -921,5 +941,93 @@ mod tests {
             Lookup::NoBinding { known_app: false, family: None }
         );
         assert!(empty.actions_for("chrome.exe").is_empty());
+    }
+
+    // ---- macOS seed (docs/features/155, 156). Pure data checks: they run on every OS, so a typo in
+    // seed_macos.json fails the Windows build too.
+
+    fn mac_chord(exe: &str, a: Action, n: Option<u32>) -> Option<String> {
+        match SEED_MACOS.lookup(exe, a, n) {
+            Lookup::Found { chord, .. } => Some(chord.display()),
+            _ => None,
+        }
+    }
+
+    /// Canonical display form of a chord string, so "Cmd+Shift+Z" compares equal however the modifiers are ordered.
+    fn norm(text: &str) -> &'static str {
+        Box::leak(parse_chord(text).expect("chord").display().into_boxed_str())
+    }
+
+    #[test]
+    fn macos_seed_is_valid_and_loaded() {
+        ShortcutMap::from_json(SEED_MACOS_JSON).expect("macOS seed must parse and validate");
+        assert!(SEED_MACOS.family_of("com.google.chrome").is_some(), "macOS seed actually loaded");
+    }
+
+    #[test]
+    fn macos_seed_uses_cmd_not_ctrl_for_the_editing_and_tab_basics() {
+        // The whole point of a separate table: Ctrl+C on a Mac is not "copy".
+        assert_eq!(mac_chord("com.apple.textedit", Action::Copy, None).as_deref(), Some(norm("Cmd+C")));
+        assert_eq!(mac_chord("com.apple.textedit", Action::Paste, None).as_deref(), Some(norm("Cmd+V")));
+        assert_eq!(mac_chord("com.google.chrome", Action::NewTab, None).as_deref(), Some(norm("Cmd+T")));
+        assert_eq!(mac_chord("com.brave.browser", Action::CloseTab, None).as_deref(), Some(norm("Cmd+W")));
+        assert_eq!(mac_chord("com.google.chrome", Action::GotoTab, Some(3)).as_deref(), Some(norm("Cmd+3")));
+        assert_eq!(mac_chord("com.google.chrome", Action::AddressBar, None).as_deref(), Some(norm("Cmd+L")));
+        // Tab switching is Ctrl+Tab in Chromium browsers on macOS (documented), not Cmd.
+        assert_eq!(mac_chord("com.google.chrome", Action::NextTab, None).as_deref(), Some(norm("Ctrl+Tab")));
+    }
+
+    #[test]
+    fn macos_seed_global_table_has_no_ctrl_chords_for_editing() {
+        let v: serde_json::Value = serde_json::from_str(SEED_MACOS_JSON).expect("valid json");
+        let global = v["bindings"]["*"].as_object().expect("global table");
+        for (action, chord) in global {
+            let c = chord.as_str().unwrap_or_default();
+            assert!(!c.starts_with("Ctrl+"), "global '{action}' = {c}: Ctrl+ is not the Mac modifier");
+        }
+    }
+
+    #[test]
+    fn macos_seed_safari_does_not_inherit_the_chromium_number_row() {
+        // Cmd+1..9 is "open favourite N" in Safari unless a setting is changed: no goto_tab_n binding there.
+        assert!(!matches!(SEED_MACOS.lookup("com.apple.safari", Action::GotoTab, Some(2)), Lookup::Found { .. }));
+        assert_eq!(mac_chord("com.apple.safari", Action::NewTab, None).as_deref(), Some(norm("Cmd+T")));
+    }
+
+    #[test]
+    fn macos_terminals_do_not_inherit_the_global_table() {
+        // Cmd+A / Cmd+S / Cmd+Z in a terminal are not safe defaults; only the explicit terminal table applies.
+        for exe in ["com.apple.terminal", "com.googlecode.iterm2"] {
+            for a in [Action::SelectAll, Action::Save, Action::Undo, Action::Cut, Action::Redo] {
+                assert!(
+                    !matches!(SEED_MACOS.lookup(exe, a, None), Lookup::Found { .. }),
+                    "{exe} {a:?} must not bind"
+                );
+            }
+            assert_eq!(mac_chord(exe, Action::Paste, None).as_deref(), Some(norm("Cmd+V")));
+        }
+    }
+
+    #[test]
+    fn macos_seed_bundle_ids_are_lowercase_and_not_exe_names() {
+        let v: serde_json::Value = serde_json::from_str(SEED_MACOS_JSON).expect("valid json");
+        for (fam, def) in v["families"].as_object().expect("families") {
+            for e in def["exes"].as_array().expect("exes") {
+                let id = e.as_str().expect("string");
+                assert_eq!(id, id.to_lowercase(), "{fam}: '{id}' must be lower-case (lookup lower-cases)");
+                assert!(!id.ends_with(".exe"), "{fam}: '{id}' is a Windows name");
+                assert!(id.contains('.'), "{fam}: '{id}' does not look like a bundle id");
+            }
+        }
+    }
+
+    #[test]
+    fn active_seed_is_the_windows_map_off_macos() {
+        // Windows behaviour must be exactly as before the macOS map existed.
+        if !cfg!(target_os = "macos") {
+            assert!(std::ptr::eq(active_seed(), &*SEED));
+        } else {
+            assert!(std::ptr::eq(active_seed(), &*SEED_MACOS));
+        }
     }
 }

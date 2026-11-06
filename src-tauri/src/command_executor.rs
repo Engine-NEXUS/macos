@@ -206,6 +206,62 @@ const PROTECTED_PROCESSES: &[&str] = &[
     "system", "registry", "sihost", "fontdrvhost", "taskhostw", "nexus",
 ];
 
+/// The macOS equivalents of the list above: the desktop shell, the login/session processes and the assistant.
+/// `loginwindow` is the dangerous one: ending it logs the user out. Lower-case; compared with the executable
+/// stem AND the display name (macOS apps are bundles, so there is no `.exe` to take a stem from).
+const PROTECTED_PROCESSES_MACOS: &[&str] = &[
+    "finder", "dock", "loginwindow", "windowserver", "systemuiserver", "controlcenter", "notificationcenter",
+    "launchd", "kernel_task", "coreservicesd", "universalaccessd", "nexus",
+];
+
+/// Is this a process voice must never close? `macos` is passed in (not read from `cfg!`) so the macOS list can be
+/// unit-tested on every OS; with `macos == false` the result is exactly the old Windows-list check.
+fn is_protected_process(stem: &str, display: &str, macos: bool) -> bool {
+    if PROTECTED_PROCESSES.contains(&stem) {
+        return true;
+    }
+    macos && {
+        let display = display.trim().to_lowercase();
+        PROTECTED_PROCESSES_MACOS.contains(&stem) || PROTECTED_PROCESSES_MACOS.contains(&display.as_str())
+    }
+}
+
+/// The AppleScript for a polite quit. The app name arrives as `argv`, never spliced into the script text, so a
+/// spoken or registry name cannot inject AppleScript. It checks the app is running first (telling a closed app to
+/// quit would launch it), and `quit` lets the app ask to save, like the Windows `taskkill` without `/F`.
+///
+/// Compiled on macOS (where `close_app` uses it) and in tests on every OS (so the injection and guard tests run on
+/// Windows and Linux CI). It is NOT compiled into a Windows release build, where the dead-code ratchet would
+/// rightly flag an unused item.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_QUIT_SCRIPT: &[&str] = &[
+    "on run argv",
+    "set appName to item 1 of argv",
+    "tell application \"System Events\" to set isRunning to ((name of every application process) contains appName)",
+    "if isRunning then",
+    "tell application appName to quit",
+    "return \"quit\"",
+    "end if",
+    "return \"not running\"",
+    "end run",
+];
+
+/// `osascript` arguments for a polite quit of `name`, or None when the name is not a plausible app name.
+#[cfg(any(target_os = "macos", test))]
+fn macos_quit_args(name: &str) -> Option<Vec<String>> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 80 || name.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let mut args: Vec<String> = Vec::new();
+    for line in MACOS_QUIT_SCRIPT {
+        args.push("-e".into());
+        args.push((*line).into());
+    }
+    args.push(name.into());
+    Some(args)
+}
+
 /// What `close_app` will do for a spoken target. Pure apart from the registry read (unit-tested).
 #[derive(Debug, PartialEq)]
 enum ClosePlan {
@@ -241,14 +297,14 @@ fn plan_close(target: &str) -> ClosePlan {
     };
     let stem = exe.to_lowercase();
     let stem = stem.trim_end_matches(".exe");
-    if PROTECTED_PROCESSES.contains(&stem) {
+    if is_protected_process(stem, &display, cfg!(target_os = "macos")) {
         return ClosePlan::Refuse(format!("I won't close {}, sir.", capitalize(&display)));
     }
     ClosePlan::Close { display, exe }
 }
 
 /// Close an application by name. Windows: a polite `taskkill` (WM_CLOSE: the app can ask
-/// to save), never `/F` and never a name-substring kill. Unix: `pkill -x`.
+/// to save), never `/F` and never a name-substring kill. macOS: a polite AppleScript quit. Other Unix: `pkill -x`.
 fn close_app(target: &str) -> Result<CommandResult, String> {
     let (app_name, exe_name) = match plan_close(target) {
         ClosePlan::Refuse(message) => return Ok(CommandResult { success: false, message }),
@@ -293,7 +349,35 @@ fn close_app(target: &str) -> Result<CommandResult, String> {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    // macOS: a polite quit (the app can ask to save), never a signal. `pkill -x` used to be the only Unix path, which
+    // hard-kills the app and, for the wrong name, the Mac's own shell or the login session.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = &exe_name;
+        let Some(args) = macos_quit_args(&app_name) else {
+            return Ok(CommandResult { success: false, message: format!("I couldn't close {}, sir.", capitalize(&app_name)) });
+        };
+        return match Command::new("osascript").args(&args).output() {
+            Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "quit" => {
+                tracing::info!("asked '{}' to quit", app_name);
+                Ok(CommandResult { success: true, message: format!("Closed {}, sir.", capitalize(&app_name)) })
+            }
+            Ok(o) if o.status.success() => Ok(CommandResult {
+                success: false,
+                message: format!("I couldn't find {} running, sir.", capitalize(&app_name)),
+            }),
+            Ok(o) => {
+                tracing::warn!("polite quit of '{}' failed: {}", app_name, String::from_utf8_lossy(&o.stderr).trim());
+                Ok(CommandResult { success: false, message: format!("I couldn't close {}, sir.", capitalize(&app_name)) })
+            }
+            Err(e) => {
+                tracing::error!("failed to run osascript for '{}': {}", app_name, e);
+                Ok(CommandResult { success: false, message: format!("I couldn't close {}, sir.", capitalize(&app_name)) })
+            }
+        };
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         let _ = &exe_name;
         let output = Command::new("pkill").args(["-x", &app_name]).output();
@@ -742,7 +826,7 @@ fn browser_key(keys: &str, label: &str) -> Result<CommandResult, String> {
     // of a detached PowerShell SendKeys that never checked the window and reported success regardless.
     // Unknown apps (e.g. a browser not in the seed) keep the old behaviour below; known apps without that
     // shortcut, protected windows and a window change are refused with a spoken reason.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     if crate::shortcuts::enabled() {
         use crate::shortcuts::{Action, Spoken};
         let action = match keys {
@@ -1640,10 +1724,12 @@ mod close_plan_tests {
 
     fn registry() -> test_support::Installed {
         test_support::install(vec![
-            app("Notepad", &["notepad"], r"C:\Windows\notepad.exe"),
-            app("Google Chat", &["google chat", "chat"], r"C:\x\chat.exe"),
-            app("Brave", &["brave"], r"C:\x\brave.exe"),
-            app("Windows Explorer", &["explorer", "file explorer"], r"C:\Windows\explorer.exe"),
+            // Forward slashes: `Path::file_name` splits them on Windows and on Unix, so the fixture means the same on
+            // every OS (backslash paths are one single component on macOS/Linux).
+            app("Notepad", &["notepad"], "C:/Windows/notepad.exe"),
+            app("Google Chat", &["google chat", "chat"], "C:/x/chat.exe"),
+            app("Brave", &["brave"], "C:/x/brave.exe"),
+            app("Windows Explorer", &["explorer", "file explorer"], "C:/Windows/explorer.exe"),
         ])
     }
 
@@ -1665,6 +1751,77 @@ mod close_plan_tests {
                 assert!(m.contains("Google Chat") && m.contains("haven't closed anything"), "{m}")
             }
             other => panic!("a guess must not close anything: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_macos_shell_and_login_session_are_protected_and_windows_behaviour_is_unchanged() {
+        // macOS: every shell/session process, by stem or by display name, in any case.
+        for (stem, display) in [
+            ("finder", "Finder"), ("dock", "Dock"), ("loginwindow", "loginwindow"),
+            ("windowserver", "WindowServer"), ("systemuiserver", "SystemUIServer"),
+            ("controlcenter", "Control Center"), ("x", "Finder"), ("nexus", "NEXUS"),
+        ] {
+            assert!(is_protected_process(stem, display, true), "{stem}/{display} must be protected on macOS");
+        }
+        // an ordinary app is not
+        assert!(!is_protected_process("safari", "Safari", true));
+        assert!(!is_protected_process("google chrome", "Google Chrome", true));
+        // Windows (macos == false): the old list, nothing more
+        assert!(is_protected_process("explorer", "Windows Explorer", false));
+        assert!(is_protected_process("svchost", "x", false));
+        assert!(!is_protected_process("finder", "Finder", false), "the macOS list must not leak into Windows");
+        assert!(!is_protected_process("dock", "Dock", false));
+    }
+
+    #[test]
+    fn the_macos_quit_script_gets_the_name_as_an_argument_never_inside_the_script() {
+        let args = macos_quit_args("Google Chrome").expect("a normal name");
+        assert_eq!(args.last().map(String::as_str), Some("Google Chrome"));
+        // every script line is a literal from MACOS_QUIT_SCRIPT: the name appears only as the final argv item
+        let script: Vec<&str> = args.iter().filter(|a| a.as_str() != "-e").map(String::as_str).collect();
+        assert_eq!(script.len(), MACOS_QUIT_SCRIPT.len() + 1);
+        assert!(!script[..MACOS_QUIT_SCRIPT.len()].iter().any(|l| l.contains("Google Chrome")));
+        // an injection attempt is just an (ignored) app name: it cannot reach the script text
+        let nasty = macos_quit_args("x\" & (do shell script \"rm -rf ~\") & \"").expect("quotes are data");
+        assert!(!nasty[..nasty.len() - 1].iter().any(|l| l.contains("rm -rf")));
+        // not plausible names are refused outright
+        assert!(macos_quit_args("").is_none());
+        assert!(macos_quit_args("   ").is_none());
+        assert!(macos_quit_args("bad\nname").is_none());
+        assert!(macos_quit_args(&"a".repeat(81)).is_none());
+        // it checks for a running app first, so a closed app is never launched just to be quit: the quit line must sit
+        // INSIDE an `if isRunning then` block (guard line before the quit line, `end if` after it)
+        let at = |needle: &str| MACOS_QUIT_SCRIPT.iter().position(|l| *l == needle);
+        let guard = at("if isRunning then").expect("the running check is an `if isRunning then` line");
+        let quit = at("tell application appName to quit").expect("the quit line");
+        let end = at("end if").expect("the block is closed");
+        assert!(guard < quit && quit < end, "quit must be inside the running check");
+    }
+
+    /// Real macOS only (runs in the macOS CI job): the quit script must COMPILE with Apple's own compiler, because
+    /// the AppleScript syntax cannot be checked anywhere else. `osacompile` compiles without running anything.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_quit_script_compiles_with_osacompile() {
+        let out = std::env::temp_dir().join(format!("nexus-quit-{}.scpt", std::process::id()));
+        let mut cmd = Command::new("osacompile");
+        cmd.arg("-o").arg(&out);
+        for line in MACOS_QUIT_SCRIPT {
+            cmd.arg("-e").arg(line);
+        }
+        let res = cmd.output().expect("osacompile runs on macOS");
+        let _ = std::fs::remove_file(&out);
+        assert!(res.status.success(), "osacompile: {}", String::from_utf8_lossy(&res.stderr));
+    }
+
+    /// Real macOS only: the shell is refused through the whole `plan_close` path, whatever the app registry holds.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_plan_close_refuses_finder_dock_and_loginwindow() {
+        let _g = registry();
+        for name in ["finder", "Finder", "dock", "loginwindow"] {
+            assert!(matches!(plan_close(name), ClosePlan::Refuse(_)), "{name} must be refused");
         }
     }
 

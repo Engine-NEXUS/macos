@@ -226,7 +226,7 @@ fn dictate_inner(raw: &str, dictionary: Vec<(String, String)>, oneshot: bool) ->
                 Outcome::Undone
             }
             Undo::CtrlZ => {
-                let _ = crate::live::commands::keyboard::press_hotkey(&["ctrl", "z"]);
+                let _ = crate::live::commands::keyboard::press_shortcut(&["ctrl", "z"]);
                 Outcome::Undone
             }
             Undo::Nothing => Outcome::Nothing,

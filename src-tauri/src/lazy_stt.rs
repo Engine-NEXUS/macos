@@ -125,6 +125,20 @@ fn stt_child_env() -> Vec<(String, String)> {
 /// 2. Windows registry: HKCU/HKLM PythonCore\3.13, 3.12, 3.11, 3.10
 /// 3. Common per-user and system install locations
 pub fn find_python() -> Option<String> {
+    // macOS has its own search: the stock /usr/bin/python3 is an Apple stub that opens an install dialog (card M12).
+    #[cfg(target_os = "macos")]
+    {
+        crate::mac_interpreters::find_python()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        find_python_generic()
+    }
+}
+
+/// The Windows / Linux search (everything `find_python` did before macOS got its own).
+#[cfg(not(target_os = "macos"))]
+fn find_python_generic() -> Option<String> {
     // 1. Try PATH-based commands â€” verify each actually works
     for cmd in &["python", "python3", "py"] {
         if let Ok(output) = crate::no_window::command(cmd).arg("--version").output() {

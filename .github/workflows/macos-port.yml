@@ -6,10 +6,16 @@ name: macOS port check
 # (docs/features/117: nothing has ever run on macOS).
 on:
   push:
-    branches: [feat/action-kernel]
+    branches: [main, feat/action-kernel, 'claude/**']
+    # a probe-only or docs-only push must not cancel and restart the 35-minute build
+    paths-ignore: ['.github/workflows/macos-probe.yml', 'docs/**']
   pull_request:
-    branches: [feat/action-kernel]
+    paths-ignore: ['.github/workflows/macos-probe.yml', 'docs/**']
   workflow_dispatch:
+
+concurrency:
+  group: macos-port-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   compile:
@@ -29,6 +35,10 @@ jobs:
       - name: npm install (frontend)
         run: npm --prefix frontend install
 
+      # tauri::generate_context! needs frontendDist to exist at compile time.
+      - name: Build frontend
+        run: npm --prefix frontend run build
+
       # The port gate: typecheck-only for the Apple-Silicon target, catching
       # any unresolved-Windows-symbol regressions the static classifier
       # reports as zero.
@@ -36,6 +46,24 @@ jobs:
         working-directory: src-tauri
         run: cargo check --lib --target aarch64-apple-darwin
 
+      # Failures here fail the job. (This step used to be `continue-on-error`, which reported "success" while 7 tests
+      # were failing; the first real run was only noticed by reading the log.)
       - name: cargo test --lib (macOS host)
         working-directory: src-tauri
-        run: cargo test --lib
+        run: |
+          set -o pipefail
+          cargo test --lib -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/mac-test.log"
+
+      # Always runs, so a failing or non-compiling test run still leaves a readable summary on the run page.
+      - name: Test summary
+        if: always()
+        run: |
+          LOG="$RUNNER_TEMP/mac-test.log"
+          {
+            echo "### macOS unit tests"
+            grep -E "^test result:" "$LOG" || echo "no test result line (did the tests compile?)"
+            echo ""
+            echo "Failing tests:"
+            grep -E "^test .* \.\.\. FAILED$" "$LOG" | sed 's/^test \(.*\) \.\.\. FAILED$/- \1/' || echo "- none"
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E "^test .* \.\.\. FAILED$" "$LOG" | sed 's/^test \(.*\) \.\.\. FAILED$/::error title=macOS test failed::\1/' || true

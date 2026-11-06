@@ -51,6 +51,10 @@ pub const DENIED_TARGETS: &[&str] = &[
     "metamask",
     "trezor",
     "ledger",
+    // macOS bundle ids that do not contain one of the names above (targets are matched as substrings).
+    "onepassword",
+    "agilebits",
+    "com.apple.passwords",
 ];
 
 /// Actions that always require user confirmation before execution.

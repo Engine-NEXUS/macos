@@ -387,7 +387,7 @@ pub fn switch_browser_tab(index: u32) -> Result<String, String> {
     }
     // Shortcut brain (E1): layout-independent virtual-key chord for the app in front, foreground re-checked
     // right before sending. Unknown apps keep the legacy Ctrl+digit below.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     if crate::shortcuts::enabled() {
         use crate::shortcuts::{Action, Spoken};
         match crate::shortcuts::do_action_spoken(Action::GotoTab, Some(index), true) {
@@ -397,11 +397,13 @@ pub fn switch_browser_tab(index: u32) -> Result<String, String> {
         }
     }
     use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+    // Windows/Linux browsers switch tabs with Ctrl+digit, Chromium-family browsers on a Mac with Cmd+digit.
+    let primary = if cfg!(target_os = "macos") { Key::Meta } else { Key::Control };
     let mut enigo =
         Enigo::new(&Settings::default()).map_err(|e| format!("enigo init: {e}"))?;
     enigo
-        .key(Key::Control, Direction::Press)
-        .map_err(|e| format!("ctrl press: {e}"))?;
+        .key(primary, Direction::Press)
+        .map_err(|e| format!("modifier press: {e}"))?;
     let digit = match index {
         1 => Key::Unicode('1'),
         2 => Key::Unicode('2'),
@@ -416,7 +418,7 @@ pub fn switch_browser_tab(index: u32) -> Result<String, String> {
     let r = enigo
         .key(digit, Direction::Click)
         .map_err(|e| format!("digit: {e}"));
-    let _ = enigo.key(Key::Control, Direction::Release);
+    let _ = enigo.key(primary, Direction::Release);
     r?;
     Ok(format!("Switched to tab {index}, sir."))
 }

@@ -1,0 +1,115 @@
+name: macOS probe
+
+# A lab, not a gate. It runs small macOS commands on a real Apple-silicon runner and prints what they return, so that
+# macOS code is written from observed output instead of guesses (docs/features/155, 156). It builds no Rust, so it takes
+# about a minute. It runs only when this file changes (or by hand), so it does not slow the normal macOS check.
+on:
+  push:
+    branches: ['claude/**']
+    paths: ['.github/workflows/macos-probe.yml']
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: macOS command probe
+    runs-on: macos-14
+    steps:
+      - name: System
+        run: |
+          sw_vers
+          uname -m
+
+      - name: "Foreground app via lsappinfo (no permission needed)"
+        run: |
+          set +e
+          echo "--- lsappinfo front"; time lsappinfo front
+          FRONT="$(lsappinfo front)"
+          echo "--- front ASN: [$FRONT]"
+          echo "--- lsappinfo info (name, bundleid, pid, bundlepath)"
+          time lsappinfo info -only name -only bundleid -only pid -only bundlepath "$FRONT"
+          echo "--- lsappinfo list (first 12 lines)"
+          lsappinfo list | head -12
+
+      - name: "Foreground app and window title via System Events (needs Automation permission)"
+        run: |
+          set +e
+          echo "--- frontmost process name"
+          time osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true'
+          echo "exit=$?"
+          echo "--- frontmost window title"
+          time osascript -e 'tell application "System Events" to get title of front window of (first application process whose frontmost is true)'
+          echo "exit=$?"
+
+      - name: "Polite quit script against a NOT running app (must print: not running)"
+        run: |
+          set +e
+          cat > /tmp/quit.sh <<'EOF'
+          osascript \
+            -e 'on run argv' \
+            -e 'set appName to item 1 of argv' \
+            -e 'tell application "System Events" to set isRunning to ((name of every application process) contains appName)' \
+            -e 'if isRunning then' \
+            -e 'tell application appName to quit' \
+            -e 'return "quit"' \
+            -e 'end if' \
+            -e 'return "not running"' \
+            -e 'end run' \
+            "$1"
+          EOF
+          echo "--- NoSuchAppNexusTest"; bash /tmp/quit.sh "NoSuchAppNexusTest"; echo "exit=$?"
+
+      - name: "Polite quit script against a RUNNING app (open TextEdit, then quit it; must print: quit)"
+        run: |
+          set +e
+          open -a TextEdit; sleep 4
+          echo "--- is it running?"; osascript -e 'tell application "System Events" to get (name of every application process) contains "TextEdit"'
+          echo "--- quit it"; bash /tmp/quit.sh "TextEdit"; echo "exit=$?"
+          sleep 3
+          echo "--- still running after quit?"; osascript -e 'tell application "System Events" to get (name of every application process) contains "TextEdit"'
+          echo "--- name with a quote and spaces is data, never code"; bash /tmp/quit.sh 'x" & (do shell script "echo INJECTED") & "'; echo "exit=$?"
+
+      - name: "Round 2: lsappinfo argument forms and records"
+        run: |
+          set +e
+          FRONT="$(lsappinfo front)"; BARE="${FRONT%:}"
+          echo "front=[$FRONT] bare=[$BARE]"
+          for arg in "$FRONT" "$BARE"; do
+            echo "=== arg [$arg]"
+            echo "--- info -only name";     lsappinfo info -only name "$arg"
+            echo "--- info -only bundleid"; lsappinfo info -only bundleid "$arg"
+            echo "--- info -only pid";      lsappinfo info -only pid "$arg"
+            echo "--- info (all, first 14 lines)"; lsappinfo info "$arg" | head -14
+          done
+          echo "=== the lsappinfo list record that contains the front ASN"
+          lsappinfo list | awk -v a="$FRONT" 'BEGIN{RS="";FS="\n"} index($0,a){print; print "----"}' | head -24
+          echo "=== visibleProcessList"; lsappinfo visibleProcessList | head -5
+          echo "=== front ASN list position"; lsappinfo list | grep -n "ASN:" | head -8
+
+      - name: "Round 2: foreground after TextEdit opens (real window)"
+        run: |
+          set +e
+          open -a TextEdit; sleep 3
+          FRONT="$(lsappinfo front)"; echo "front=[$FRONT]"
+          lsappinfo list | awk -v a="$FRONT" 'BEGIN{RS="";FS="\n"} index($0,a){print}' | head -8
+          echo "=== one-shot System Events: name|bundle|pid|window title"
+          cat > /tmp/fg.sh <<'EOF'
+          osascript \
+            -e 'tell application "System Events"' \
+            -e 'set p to first application process whose frontmost is true' \
+            -e 'set t to ""' \
+            -e 'try' \
+            -e 'set t to name of front window of p' \
+            -e 'end try' \
+            -e 'return (name of p) & "|" & (bundle identifier of p) & "|" & (unix id of p) & "|" & t' \
+            -e 'end tell'
+          EOF
+          for i in 1 2 3; do /usr/bin/time -p bash /tmp/fg.sh; done
+          echo "=== windows of every visible process"
+          osascript -e 'tell application "System Events" to get name of every application process whose visible is true'
+          echo "=== cleanup"; osascript -e 'tell application "TextEdit" to quit saving no'
+
+      - name: "Keystroke permission (Accessibility) check"
+        run: |
+          set +e
+          echo "--- can this process post a keystroke via System Events? (needs Accessibility)"
+          osascript -e 'tell application "System Events" to keystroke "a" using {command down}' ; echo "exit=$?"
