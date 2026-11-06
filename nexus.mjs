@@ -121,7 +121,11 @@ function has(cmd) {
 function hasNpm() { return has("npm"); }
 function hasCargo() { return has("cargo"); }
 function hasPython() { return has("python") || has("python3"); }
-function pythonCmd() { return has("python") ? "python" : "python3"; }
+/// macOS: the repo's .venv (see macVenvPython); Homebrew and uv Pythons refuse a global `pip install` (PEP 668).
+function pythonCmd() {
+  if (IS_MAC) return macVenvPython();
+  return has("python") ? "python" : "python3";
+}
 
 // ─── OS-specific prerequisite installation ───────────────────────────────────
 
@@ -298,8 +302,12 @@ function macVenvPython() {
   const venv = join(ROOT, ".venv");
   const py = join(venv, "bin", "python3");
   if (!existsSync(py)) {
-    if (has("uv")) run("uv", ["venv", "--python", "3.12", venv], { allowFail: true });
+    if (has("uv")) run("uv", ["venv", "--seed", "--python", "3.12", venv], { allowFail: true });
     else run("python3", ["-m", "venv", venv], { allowFail: true });
+  }
+  // pip inside the venv, so every `python -m pip install` in this script works (a venv made without --seed has none).
+  if (existsSync(py) && !existsSync(join(venv, "bin", "pip")) && has("uv")) {
+    run("uv", ["pip", "install", "--python", py, "pip"], { allowFail: true, silent: true });
   }
   return py;
 }
@@ -1186,6 +1194,11 @@ function cmdWake() {
     if (!existsSync(testScript)) {
       err("Test script not found: " + testScript);
       process.exit(1);
+    }
+    // The tester runs the wake model itself; the dependency step above does not cover ONNX Runtime.
+    if (spawnSync(py, ["-c", "import onnxruntime"], { encoding: "utf-8" }).status !== 0) {
+      info("Installing onnxruntime for the wake tester...");
+      run(py, ["-m", "pip", "install", "onnxruntime"], { allowFail: true });
     }
     const testArgs = process.argv.slice(4);
     if (sub === "benchmark" && !testArgs.includes("--batch")) {
