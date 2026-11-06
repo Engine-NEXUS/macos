@@ -52,6 +52,18 @@ fn dimension_to_i32(v: f64) -> Option<i32> {
 /// BGRA of an on-screen rectangle in points. None when the permission is
 /// missing or the capture fails — callers degrade to None, never crash.
 pub(crate) fn capture_bgra(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
+    let img = capture_native(x, y, w, h)?;
+    let rgba = if img.dimensions() == (w as u32, h as u32) {
+        img.to_rgba8()
+    } else {
+        image::imageops::resize(&img, w as u32, h as u32, image::imageops::FilterType::Triangle)
+    };
+    Some(rgba_to_bgra(&rgba))
+}
+
+/// An on-screen rectangle given in points, at the display's native resolution (2x on Retina, not resized). OCR reads
+/// small text far better at native pixels; map results back to points with the width ratio.
+pub(crate) fn capture_native(x: i32, y: i32, w: i32, h: i32) -> Option<image::DynamicImage> {
     if w <= 0 || h <= 0 {
         return None;
     }
@@ -73,12 +85,7 @@ pub(crate) fn capture_bgra(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
     }
     let img = image::ImageReader::open(&png).ok()?.decode().ok()?;
     let _ = std::fs::remove_file(&png);
-    let rgba = if img.dimensions() == (w as u32, h as u32) {
-        img.to_rgba8()
-    } else {
-        image::imageops::resize(&img, w as u32, h as u32, image::imageops::FilterType::Triangle)
-    };
-    Some(rgba_to_bgra(&rgba))
+    Some(img)
 }
 
 /// The Windows callers' contract is BGRA (B first); PNG decodes RGBA, so

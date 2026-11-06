@@ -112,8 +112,10 @@ pub(crate) fn trusted() -> bool {
 #[cfg(target_os = "macos")]
 const MAX_NODES: usize = 6000;
 
+/// Accessibility FFI and helpers, shared with the other macOS screen modules (Ghost press, window tiling, screen
+/// context). Keep raw `extern` declarations here rather than repeating them per module.
 #[cfg(target_os = "macos")]
-mod mac {
+pub(crate) mod mac {
     use super::{kind_for_role, pick_name, Rect};
     use crate::screen::UiElement;
     use core_foundation_sys::array::{
@@ -128,47 +130,49 @@ mod mac {
     use std::ffi::{c_char, c_void};
     use std::time::{Duration, Instant};
 
-    type AXError = i32;
-    const AX_VALUE_CGPOINT: u32 = 1;
-    const AX_VALUE_CGSIZE: u32 = 2;
+    pub(crate) type AXError = i32;
+    pub(crate) const AX_VALUE_CGPOINT: u32 = 1;
+    pub(crate) const AX_VALUE_CGSIZE: u32 = 2;
     /// Per-call limit for a cross-process accessibility request (the system default is 6 s, so one hung app would stall
     /// the voice pipeline).
     const MESSAGING_TIMEOUT_S: f32 = 0.5;
 
     #[repr(C)]
-    #[derive(Default)]
-    struct CGPoint {
-        x: f64,
-        y: f64,
+    #[derive(Default, Debug, Clone, Copy)]
+    pub(crate) struct CGPoint {
+        pub x: f64,
+        pub y: f64,
     }
     #[repr(C)]
-    #[derive(Default)]
-    struct CGSize {
-        w: f64,
-        h: f64,
+    #[derive(Default, Debug, Clone, Copy)]
+    pub(crate) struct CGSize {
+        pub w: f64,
+        pub h: f64,
     }
 
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn AXIsProcessTrusted() -> u8;
-        fn AXUIElementCreateSystemWide() -> CFTypeRef;
-        fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef;
-        fn AXUIElementCopyAttributeValue(el: CFTypeRef, attr: CFStringRef, value: *mut CFTypeRef) -> AXError;
-        fn AXUIElementCopyMultipleAttributeValues(
+        pub(crate) fn AXUIElementCreateSystemWide() -> CFTypeRef;
+        pub(crate) fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef;
+        pub(crate) fn AXUIElementCopyAttributeValue(el: CFTypeRef, attr: CFStringRef, value: *mut CFTypeRef) -> AXError;
+        pub(crate) fn AXUIElementCopyMultipleAttributeValues(
             el: CFTypeRef,
             attrs: CFArrayRef,
             options: u32,
             values: *mut CFArrayRef,
         ) -> AXError;
-        fn AXUIElementSetAttributeValue(el: CFTypeRef, attr: CFStringRef, value: CFTypeRef) -> AXError;
-        fn AXUIElementSetMessagingTimeout(el: CFTypeRef, seconds: f32) -> AXError;
-        fn AXValueGetTypeID() -> CFTypeID;
-        fn AXValueGetType(v: CFTypeRef) -> u32;
-        fn AXValueGetValue(v: CFTypeRef, kind: u32, out: *mut c_void) -> u8;
+        pub(crate) fn AXUIElementSetAttributeValue(el: CFTypeRef, attr: CFStringRef, value: CFTypeRef) -> AXError;
+        pub(crate) fn AXUIElementSetMessagingTimeout(el: CFTypeRef, seconds: f32) -> AXError;
+        pub(crate) fn AXUIElementPerformAction(el: CFTypeRef, action: CFStringRef) -> AXError;
+        pub(crate) fn AXValueCreate(kind: u32, value: *const c_void) -> CFTypeRef;
+        pub(crate) fn AXValueGetTypeID() -> CFTypeID;
+        pub(crate) fn AXValueGetType(v: CFTypeRef) -> u32;
+        pub(crate) fn AXValueGetValue(v: CFTypeRef, kind: u32, out: *mut c_void) -> u8;
     }
 
     /// An owned Core Foundation reference, released on drop.
-    struct Owned(CFTypeRef);
+    pub(crate) struct Owned(pub(crate) CFTypeRef);
 
     impl Drop for Owned {
         fn drop(&mut self) {
@@ -179,12 +183,12 @@ mod mac {
 
     impl Owned {
         /// Takes a +1 reference (create/copy rule). None for null.
-        fn new(r: CFTypeRef) -> Option<Self> {
+        pub(crate) fn new(r: CFTypeRef) -> Option<Self> {
             (!r.is_null()).then_some(Self(r))
         }
 
         /// Retains a borrowed reference (get rule) so it outlives its container.
-        fn retain(r: CFTypeRef) -> Option<Self> {
+        pub(crate) fn retain(r: CFTypeRef) -> Option<Self> {
             if r.is_null() {
                 return None;
             }
@@ -194,7 +198,7 @@ mod mac {
         }
     }
 
-    fn cf_string(s: &str) -> Owned {
+    pub(crate) fn cf_string(s: &str) -> Owned {
         // SAFETY: plain CF constructor over a valid UTF-8 buffer; never null for valid UTF-8.
         let r = unsafe {
             CFStringCreateWithBytes(kCFAllocatorDefault, s.as_ptr(), s.len() as CFIndex, kCFStringEncodingUTF8, 0)
@@ -203,12 +207,12 @@ mod mac {
     }
 
     /// A CFArray of attribute names, plus the strings it was built from.
-    struct Names {
-        array: Owned,
+    pub(crate) struct Names {
+        pub(crate) array: Owned,
         _strings: Vec<Owned>,
     }
 
-    fn names(list: &[&str]) -> Names {
+    pub(crate) fn names(list: &[&str]) -> Names {
         let strings: Vec<Owned> = list.iter().map(|s| cf_string(s)).collect();
         let ptrs: Vec<*const c_void> = strings.iter().map(|s| s.0).collect();
         // SAFETY: `ptrs` holds live CFStrings; the array retains each through kCFTypeArrayCallBacks.
@@ -219,7 +223,7 @@ mod mac {
     }
 
     // SAFETY (the readers below): `v` is null or a live CF object; each checks the type before reading it.
-    unsafe fn string_of(v: CFTypeRef) -> String {
+    pub(crate) unsafe fn string_of(v: CFTypeRef) -> String {
         if v.is_null() || CFGetTypeID(v) != CFStringGetTypeID() {
             return String::new();
         }
@@ -233,14 +237,14 @@ mod mac {
         String::from_utf8_lossy(&buf[..end]).into_owned()
     }
 
-    unsafe fn bool_of(v: CFTypeRef) -> Option<bool> {
+    pub(crate) unsafe fn bool_of(v: CFTypeRef) -> Option<bool> {
         if v.is_null() || CFGetTypeID(v) != CFBooleanGetTypeID() {
             return None;
         }
         Some(CFBooleanGetValue(v as CFBooleanRef))
     }
 
-    unsafe fn ax_value<T: Default>(v: CFTypeRef, kind: u32) -> Option<T> {
+    pub(crate) unsafe fn ax_value<T: Default>(v: CFTypeRef, kind: u32) -> Option<T> {
         if v.is_null() || CFGetTypeID(v) != AXValueGetTypeID() || AXValueGetType(v) != kind {
             return None;
         }
@@ -248,7 +252,7 @@ mod mac {
         (AXValueGetValue(v, kind, &mut out as *mut T as *mut c_void) != 0).then_some(out)
     }
 
-    unsafe fn children_of(v: CFTypeRef) -> Vec<Owned> {
+    pub(crate) unsafe fn children_of(v: CFTypeRef) -> Vec<Owned> {
         if v.is_null() || CFGetTypeID(v) != CFArrayGetTypeID() {
             return Vec::new();
         }
@@ -256,7 +260,7 @@ mod mac {
         (0..CFArrayGetCount(a)).filter_map(|i| Owned::retain(CFArrayGetValueAtIndex(a, i))).collect()
     }
 
-    fn copy_attr(el: &Owned, attr: &str) -> Option<Owned> {
+    pub(crate) fn copy_attr(el: &Owned, attr: &str) -> Option<Owned> {
         let name = cf_string(attr);
         let mut out: CFTypeRef = std::ptr::null();
         // SAFETY: `el` is a live AXUIElement; `out` receives a +1 reference on success.
@@ -268,32 +272,32 @@ mod mac {
         }
     }
 
-    fn set_bool(el: &Owned, attr: &str, value: bool) -> bool {
+    pub(crate) fn set_bool(el: &Owned, attr: &str, value: bool) -> bool {
         let name = cf_string(attr);
         // SAFETY: the CF boolean constants are immortal; `el` is a live AXUIElement.
         let v = unsafe { if value { kCFBooleanTrue } else { kCFBooleanFalse } };
         unsafe { AXUIElementSetAttributeValue(el.0, name.0 as CFStringRef, v as CFTypeRef) == 0 }
     }
 
-    pub(super) fn trusted() -> bool {
+    pub(crate) fn trusted() -> bool {
         // SAFETY: plain query, no arguments.
         unsafe { AXIsProcessTrusted() != 0 }
     }
 
     /// What one element says about itself, read in a single cross-process call.
-    struct Node {
-        role: String,
-        subrole: String,
-        title: String,
-        description: String,
-        placeholder: String,
-        help: String,
-        frame: Option<Rect>,
-        enabled: bool,
-        children: Vec<Owned>,
+    pub(crate) struct Node {
+        pub(crate) role: String,
+        pub(crate) subrole: String,
+        pub(crate) title: String,
+        pub(crate) description: String,
+        pub(crate) placeholder: String,
+        pub(crate) help: String,
+        pub(crate) frame: Option<Rect>,
+        pub(crate) enabled: bool,
+        pub(crate) children: Vec<Owned>,
     }
 
-    const NODE_ATTRS: &[&str] = &[
+    pub(crate) const NODE_ATTRS: &[&str] = &[
         "AXRole",
         "AXSubrole",
         "AXTitle",
@@ -306,7 +310,7 @@ mod mac {
         "AXChildren",
     ];
 
-    fn read_node(el: &Owned, attrs: &Names) -> Option<Node> {
+    pub(crate) fn read_node(el: &Owned, attrs: &Names) -> Option<Node> {
         let mut values: CFArrayRef = std::ptr::null();
         // SAFETY: `el` is a live AXUIElement and `attrs.array` a CFArray of CFStrings; `values` receives a +1 array
         // with one entry per attribute (an AXValue error placeholder where an attribute is missing).
@@ -348,7 +352,7 @@ mod mac {
 
     /// The words inside a control with no title of its own (a web link is usually a text child): its first few text
     /// children's values, joined.
-    fn inner_text(children: &[Owned], attrs: &Names) -> String {
+    pub(crate) fn inner_text(children: &[Owned], attrs: &Names) -> String {
         let mut parts: Vec<String> = Vec::new();
         for child in children.iter().take(4) {
             let mut values: CFArrayRef = std::ptr::null();
@@ -389,11 +393,12 @@ mod mac {
         electron || chromium
     }
 
-    pub(super) fn list(budget: Duration, max_nodes: usize) -> Result<Vec<UiElement>, String> {
+    /// The app in front (never NEXUS itself), its application element and its focused (else main) window. Sets the
+    /// process-wide per-call timeout first. Err carries a plain reason for the log.
+    pub(crate) fn front_window() -> Result<(crate::macos_foreground::FrontApp, Owned, Owned), String> {
         if !trusted() {
             return Err("Accessibility permission missing (System Settings → Privacy & Security → Accessibility)".into());
         }
-        let deadline = Instant::now() + budget;
         let front = crate::macos_foreground::front_app().ok_or("cannot tell which app is in front")?;
         if front.pid == std::process::id() {
             return Err("NEXUS itself is in front".into());
@@ -401,14 +406,43 @@ mod mac {
         // SAFETY: plain constructors; both return +1 references.
         let system = Owned::new(unsafe { AXUIElementCreateSystemWide() }).ok_or("no system-wide element")?;
         unsafe { AXUIElementSetMessagingTimeout(system.0, MESSAGING_TIMEOUT_S) };
-        let pid = front.pid as i32;
-        let app = Owned::new(unsafe { AXUIElementCreateApplication(pid) }).ok_or("no application element")?;
-        if ask_for_web_tree(&app, pid, front.bundle_id.as_deref().unwrap_or("")) {
-            std::thread::sleep(Duration::from_millis(300));
-        }
+        let app = Owned::new(unsafe { AXUIElementCreateApplication(front.pid as i32) }).ok_or("no application element")?;
         let window = copy_attr(&app, "AXFocusedWindow")
             .or_else(|| copy_attr(&app, "AXMainWindow"))
             .ok_or_else(|| format!("{} has no window in front", front.name))?;
+        Ok((front, app, window))
+    }
+
+    /// The front app and its window's frame in global top-left points.
+    pub(crate) fn front_window_frame() -> Option<(crate::macos_foreground::FrontApp, Rect)> {
+        let (front, _app, window) = front_window().ok()?;
+        let attrs = names(&["AXPosition", "AXSize"]);
+        let mut values: CFArrayRef = std::ptr::null();
+        // SAFETY: as in `read_node`.
+        let err = unsafe { AXUIElementCopyMultipleAttributeValues(window.0, attrs.array.0 as CFArrayRef, 0, &mut values) };
+        let values = (err == 0).then(|| Owned::new(values as CFTypeRef)).flatten()?;
+        let arr = values.0 as CFArrayRef;
+        // SAFETY: two attributes requested; entries live while `values` is held.
+        let (p, s) = unsafe {
+            if CFArrayGetCount(arr) < 2 {
+                return None;
+            }
+            let p: CGPoint = ax_value(CFArrayGetValueAtIndex(arr, 0), AX_VALUE_CGPOINT)?;
+            let s: CGSize = ax_value(CFArrayGetValueAtIndex(arr, 1), AX_VALUE_CGSIZE)?;
+            (p, s)
+        };
+        Some((front, Rect { x: p.x, y: p.y, w: s.w, h: s.h }))
+    }
+
+    pub(super) fn list(budget: Duration, max_nodes: usize) -> Result<Vec<UiElement>, String> {
+        let deadline = Instant::now() + budget;
+        let (front, app, mut window) = front_window()?;
+        if ask_for_web_tree(&app, front.pid as i32, front.bundle_id.as_deref().unwrap_or("")) {
+            std::thread::sleep(Duration::from_millis(300));
+            if let Some(w) = copy_attr(&app, "AXFocusedWindow") {
+                window = w;
+            }
+        }
 
         let attrs = names(NODE_ATTRS);
         let text_attrs = names(&["AXValue", "AXTitle"]);

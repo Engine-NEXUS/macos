@@ -154,6 +154,9 @@ pub(crate) mod macos_foreground;
 // compiled in tests on every OS.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod ax_mac;
+// macOS privacy permissions for the screen features (Accessibility, Screen Recording) and their spoken guidance.
+#[cfg(target_os = "macos")]
+pub(crate) mod mac_permissions;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod mac_interpreters;
 
@@ -221,6 +224,10 @@ mod webhook;
 mod youtube_center;
 // Windows.Media.Ocr — zero-RAM local screen text extraction (Feature 86).
 #[cfg(target_os = "windows")]
+pub(crate) mod ocr;
+// macOS: Vision-framework OCR with the same functions, so `crate::ocr::…` callers work on both.
+#[cfg(target_os = "macos")]
+#[path = "ocr_mac.rs"]
 pub(crate) mod ocr;
 // Animation calibration (drag + scroll-wheel placement designer).
 pub(crate) mod calibration;
