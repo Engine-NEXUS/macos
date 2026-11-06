@@ -10039,7 +10039,8 @@ fn opened_message(in_front: bool) -> String {
 /// Wait for `target`'s window to come to the front (title match, then the foreground process name
 /// as a second opinion for apps whose title does not contain their name).
 async fn open_target_in_front(target: String) -> bool {
-    #[cfg(target_os = "windows")]
+    // macOS: foreground_process_name is the lower-case bundle id (com.google.chrome), which the same contains-check fits.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         tokio::task::spawn_blocking(move || {
             if crate::live::commands::window::wait_and_focus_app(&target, 2500) {
@@ -10054,7 +10055,7 @@ async fn open_target_in_front(target: String) -> bool {
         .await
         .unwrap_or(false)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = target;
         true

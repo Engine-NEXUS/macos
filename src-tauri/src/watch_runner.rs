@@ -394,7 +394,12 @@ fn user_idle_ms() -> Option<u64> {
     Some(now.wrapping_sub(info.dwTime) as u64)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn user_idle_ms() -> Option<u64> {
+    crate::memcore::resume::mac_idle_seconds().map(|s| (s * 1000.0) as u64)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn user_idle_ms() -> Option<u64> {
     None
 }

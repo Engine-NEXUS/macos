@@ -204,7 +204,29 @@ pub fn user_idle_secs() -> Option<u64> {
     Some(now.wrapping_sub(info.dwTime) as u64 / 1000)
 }
 
-#[cfg(not(target_os = "windows"))]
+/// Seconds since the last keyboard/mouse input (None if it cannot be read).
+#[cfg(target_os = "macos")]
+pub fn user_idle_secs() -> Option<u64> {
+    mac_idle_seconds().map(|s| s as u64)
+}
+
+/// macOS: seconds since the last hardware input event. The HID system state counts the person's keyboard, mouse and
+/// trackpad only, not events NEXUS itself posts (Ghost clicks), so its own actions never look like the user being back.
+/// No permission is needed.
+#[cfg(target_os = "macos")]
+pub(crate) fn mac_idle_seconds() -> Option<f64> {
+    const HID_SYSTEM_STATE: i32 = 1; // kCGEventSourceStateHIDSystemState
+    const ANY_INPUT_EVENT: u32 = u32::MAX; // kCGAnyInputEventType
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
+    }
+    // SAFETY: plain query with constant arguments.
+    let s = unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, ANY_INPUT_EVENT) };
+    (s.is_finite() && s >= 0.0).then_some(s)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn user_idle_secs() -> Option<u64> {
     None
 }
@@ -265,6 +287,16 @@ pub fn start_recorder<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Quartz idle query needs no permission and answers in any session (a CI runner included).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_idle_time_is_read() {
+        let s = mac_idle_seconds().expect("idle seconds");
+        assert!(s.is_finite() && s >= 0.0);
+        assert!(user_idle_secs().is_some());
+        eprintln!("idle for {s:.1} s");
+    }
 
     fn s(app: &str, title: &str, url: Option<&str>) -> Sample {
         Sample { app: app.into(), title: title.into(), url: url.map(String::from), activity: None }

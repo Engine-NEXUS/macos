@@ -379,7 +379,7 @@ pub async fn live_focus_app(target: String) -> Result<LiveResult, String> {
         return Ok(LiveResult::err(msg));
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         if commands::window::focus_app_by_title(&target) {
             let ctx = state::context();
@@ -395,7 +395,7 @@ pub async fn live_focus_app(target: String) -> Result<LiveResult, String> {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Ok(LiveResult::err("Window focus not supported on this platform"))
     }
