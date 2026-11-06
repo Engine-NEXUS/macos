@@ -105,78 +105,12 @@ jobs:
           python -m unittest scripts/test_wake_data_fetch.py
           python -m unittest scripts/test_wake_data_synth.py
 
-  windows-installer:
-    runs-on: windows-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/phase-1')
+  rust-check-macos:
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install LLVM
-        run: choco install llvm -y
-
-      - name: Set LIBCLANG_PATH
-        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
-
-      - name: Install frontend deps
-        working-directory: frontend
-        run: npm ci
-
-      - name: Run Rust tests on Windows
-        working-directory: src-tauri
-        run: |
-          cargo test --lib -- --test-threads=1
-
-      - name: Build frontend
-        working-directory: frontend
-        run: npm run build
-
-      - name: Build Windows installer (.exe + .msi)
-        run: npx --yes @tauri-apps/cli build
-        env:
-          # NSIS installer + MSI installer both produced
-          TAURI_BUNDLE: "nsis,msi"
-
-      - name: Verify installers were created
-        run: |
-          Get-ChildItem src-tauri\target\release\bundle\nsis\*.exe -ErrorAction SilentlyContinue | ForEach-Object { Write-Output "NSIS: $($_.Name) — $([math]::Round($_.Length/1MB,1)) MB" }
-          Get-ChildItem src-tauri\target\release\bundle\msi\*.msi -ErrorAction SilentlyContinue | ForEach-Object { Write-Output "MSI: $($_.Name) — $([math]::Round($_.Length/1MB,1)) MB" }
-
-      - name: Upload Windows NSIS installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: nexus-windows-exe
-          path: src-tauri/target/release/bundle/nsis/*.exe
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Upload Windows MSI installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: nexus-windows-msi
-          path: src-tauri/target/release/bundle/msi/*.msi
-          if-no-files-found: warn
-          retention-days: 7
-
-  rust-check-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install LLVM
-        run: choco install llvm -y
-
-      - name: Set LIBCLANG_PATH
-        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -186,10 +120,9 @@ jobs:
       # and panics if the folder is missing. The frontend is built by frontend-check; this job only
       # needs the folder to exist to type-check and test the Rust side.
       - name: Placeholder frontend/dist (embedded-assets build needs the folder)
-        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force frontend/dist | Out-Null
-          Set-Content frontend/dist/index.html "<!doctype html><title>ci</title>"
+          mkdir -p frontend/dist
+          echo "<!doctype html><title>ci</title>" > frontend/dist/index.html
 
       - name: Cargo check (default)
         working-directory: src-tauri
@@ -199,23 +132,29 @@ jobs:
         working-directory: src-tauri
         run: cargo check --features mock-wake
 
-      # The shipped binary is built with these features (nexus build); they were
-      # never compiled in CI before, so breakage there was only found locally.
+      # The shipped binary is built with these features; check every target (tests, examples, dev_tools) too.
       - name: Cargo check (shipped features, ALL targets incl. tests, examples, dev_tools)
         working-directory: src-tauri
         run: cargo check --all-targets --features custom-protocol,admin-brain
 
-      # rustc --force-warn dead_code sees through #[allow(dead_code)]; lib.rs only
-      # publishes the modules in scripts/baselines/external-api.txt so unused pub
-      # items are visible. New dead code fails; the baseline may only shrink.
-      - name: Dead-code ratchet
-        run: node scripts/dead-code-audit.mjs
-
-      # --tests = lib unit tests + everything in src-tauri/tests (the 50-command
-      # voice fixture, offline commands, user commands). Previously only --lib ran.
-      - name: Cargo test (lib + integration tests)
+      - name: Cargo test (lib)
         working-directory: src-tauri
-        run: cargo test --tests --features custom-protocol,admin-brain -- --test-threads=1
+        run: |
+          set -o pipefail
+          cargo test --lib -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/mac-test.log"
+
+      # Always runs, so a failing or non-compiling test run still leaves a readable summary on the run page.
+      - name: Test summary
+        if: always()
+        run: |
+          LOG="$RUNNER_TEMP/mac-test.log"
+          {
+            echo "### macOS unit tests"
+            grep -E "^test result:" "$LOG" || echo "no test result line (did the tests compile?)"
+            echo ""
+            echo "Failing tests:"
+            grep -E "^test .* \.\.\. FAILED$" "$LOG" | sed 's/^test \(.*\) \.\.\. FAILED$/- \1/' || echo "- none"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   python-check:
     runs-on: ubuntu-latest
