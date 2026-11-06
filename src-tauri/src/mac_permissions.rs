@@ -58,6 +58,31 @@ pub(crate) fn request_screen_recording() -> bool {
     screen_recording_allowed()
 }
 
+/// Make Keychain reads that would show macOS's "enter the login keychain password" dialog fail at once instead
+/// (errSecInteractionNotAllowed); callers already treat a failed read as "no saved secret". For development builds:
+/// each rebuild is a new unsigned binary, so macOS asked again for every saved secret on every start, one modal per
+/// item, while start-up waited on the main thread. Returns true when the setting took.
+pub(crate) fn disable_keychain_prompts() -> bool {
+    // SAFETY: plain per-process setter and getter; `allowed` is a valid out-pointer.
+    unsafe {
+        let status = SecKeychainSetUserInteractionAllowed(0);
+        let mut allowed: u8 = 1;
+        let read = SecKeychainGetUserInteractionAllowed(&mut allowed);
+        if status != 0 || read != 0 {
+            tracing::warn!("mac_permissions: could not turn off Keychain prompts (status {status}/{read})");
+        }
+        status == 0 && read == 0 && allowed == 0
+    }
+}
+
+// Legacy Keychain interaction switch (Security framework). Deprecated, but it is the one switch that covers the legacy
+// SecKeychainFindGenericPassword calls the `keyring` crate makes on macOS.
+#[link(name = "Security", kind = "framework")]
+extern "C" {
+    fn SecKeychainSetUserInteractionAllowed(state: u8) -> i32;
+    fn SecKeychainGetUserInteractionAllowed(state: *mut u8) -> i32;
+}
+
 /// A System Settings pane a spoken permission line points the user to.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +136,12 @@ mod tests {
     fn spoken_lines_name_the_settings_place() {
         assert!(super::SCREEN_RECORDING_LINE.contains("Screen and System Audio Recording"));
         assert!(super::ACCESSIBILITY_LINE.contains("Privacy and Security, Accessibility"));
+    }
+
+    /// Only flips this test process's own switch and reads it back; touches no Keychain item, so it cannot prompt.
+    #[test]
+    fn keychain_prompts_can_be_turned_off() {
+        assert!(super::disable_keychain_prompts());
     }
 
     /// The preflight never prompts, so it is safe in a test. Prints the answer for this process (the terminal's grant).

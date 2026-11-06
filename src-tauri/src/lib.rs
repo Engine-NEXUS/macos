@@ -426,6 +426,13 @@ fn init_logging() {
 pub fn run() {
     crate::boot::mark("main");
     init_logging();
+    // macOS development builds never show the Keychain password dialog: every rebuild is a new unsigned binary, so
+    // macOS asked again for each saved secret on every start while start-up waited on it. Reads fail like "Deny"
+    // instead. Installed (release) builds keep the normal macOS behaviour.
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    if crate::mac_permissions::disable_keychain_prompts() {
+        tracing::info!("keychain: password prompts off for this development build (saved secrets read as missing)");
+    }
     // The greeting at logon: waits for the desktop, then plays a cached clip while the rest of the app is still starting.
     early_hello::start_if_logon();
 
