@@ -7266,10 +7266,14 @@ fn strip_leading_stray_punctuation(s: &str) -> String {
 /// "answer so..." mishears).
 fn strip_leading_filler(text: &str) -> String {
     /// Single-word fillers that can precede a command.
+    // "yeah"/"yep"/"yup": local Moonshine STT often hears the listening cue as "Yeah." at the start of the command
+    // (measured on macOS: "yeah. click the equals button." went to the cloud, which answered "I can't click buttons").
+    // Never "yes": confirmations start with it ("yes, forget everything" must stay the wipe confirmation, not a new
+    // "forget everything"). One word alone is never stripped, so a bare "yeah" stays an answer.
     const FILLERS: &[&str] = &[
         "and", "so", "but", "then", "now", "also", "plus", "like", "okay",
         "ok", "well", "um", "uh", "hmm", "actually", "basically",
-        "just", "please", "now please",
+        "just", "please", "now please", "yeah", "yep", "yup",
     ];
 
     // Protect "hey nexus" / "hello nexus" / "hi nexus" — these are greetings,
@@ -7294,9 +7298,9 @@ fn strip_leading_filler(text: &str) -> String {
         }
     }
 
-    // Single-word filler — but NOT "hey" when followed by "nexus"/"there"
+    // Single-word filler — but NOT "hey" when followed by "nexus"/"there". The STT may punctuate it ("yeah." / "so,").
     if words.len() >= 2 {
-        if FILLERS.contains(&words[0]) {
+        if FILLERS.contains(&words[0].trim_end_matches(|c: char| matches!(c, '.' | ',' | '!' | '?'))) {
             return words[1..].join(" ");
         }
         // "hey" is filler only when NOT followed by "nexus" or "there"
@@ -7907,6 +7911,30 @@ mod tests {
         } else {
             panic!("expected OpenApp");
         }
+    }
+
+    #[test]
+    fn a_leading_yeah_from_the_stt_does_not_hide_the_command() {
+        // Real transcripts from the first macOS voice test (local Moonshine STT after the listening cue).
+        match parse_deterministic("yeah. click the equals button.").map(|r| r.intent) {
+            Some(ParsedIntent::NluResult { intent, slots, .. }) => {
+                assert_eq!(intent, "system_click_element");
+                assert_eq!(slots["name"], "equals");
+            }
+            other => panic!("expected system_click_element, got {other:?}"),
+        }
+        match parse_deterministic("Yeah, open calculator").map(|r| r.intent) {
+            Some(ParsedIntent::OpenApp { target }) => assert_eq!(target, "calculator"),
+            other => panic!("expected OpenApp, got {other:?}"),
+        }
+        assert_eq!(strip_leading_filler("yep open brave"), "open brave");
+        // "yes" starts confirmations and stays; one word is an answer, not a filler.
+        assert_eq!(strip_leading_filler("yes, forget everything"), "yes, forget everything");
+        assert!(matches!(
+            parse_deterministic("yes, forget everything").map(|r| r.intent),
+            Some(ParsedIntent::MemoryForgetAllConfirm)
+        ));
+        assert_eq!(strip_leading_filler("yeah"), "yeah");
     }
 
     #[test]
