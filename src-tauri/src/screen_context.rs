@@ -573,7 +573,19 @@ fn mac_browser_url(
     if let Some(url) = document.as_deref().and_then(mac_page_url) {
         return Some(url);
     }
-    let script = mac_url_script(browser, bundle_id?)?;
+    scripted_url(browser, bundle_id?)
+}
+
+/// The page URL of the front window of the browser with `bundle_id`, asked through AppleScript by its own id (nothing
+/// launches) with a bounded wait (an open Automation prompt must not hang the caller). None for a non-browser app.
+#[cfg(target_os = "macos")]
+pub(crate) fn mac_front_browser_url(bundle_id: &str) -> Option<String> {
+    scripted_url(mac_browser(bundle_id)?, bundle_id)
+}
+
+#[cfg(target_os = "macos")]
+fn scripted_url(browser: MacBrowser, bundle_id: &str) -> Option<String> {
+    let script = mac_url_script(browser, bundle_id)?;
     let out = crate::macos_foreground::run_capture(
         std::process::Command::new("osascript").args(["-e", &script]),
         std::time::Duration::from_millis(1200),

@@ -634,50 +634,11 @@ fn get_process_path(pid: u32) -> Option<std::path::PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn get_browser_url_macos() -> Option<String> {
-    // Try Chrome-family browsers (Chrome, Edge, Brave) first
-    let chrome_script = r#"
-        tell application "Google Chrome"
-            if (count of windows) > 0 then
-                return URL of active tab of front window
-            end if
-        end tell
-    "#;
-    if let Some(url) = run_applescript(chrome_script) {
-        if url.starts_with("http") {
-            return Some(url);
-        }
-    }
-
-    // Try Safari
-    let safari_script = r#"
-        tell application "Safari"
-            if (count of windows) > 0 then
-                return URL of current tab of front window
-            end if
-        end tell
-    "#;
-    if let Some(url) = run_applescript(safari_script) {
-        if url.starts_with("http") {
-            return Some(url);
-        }
-    }
-
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn run_applescript(script: &str) -> Option<String> {
-    let output = std::process::Command::new("osascript")
-        .args(["-e", script])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !url.is_empty() {
-            return Some(url);
-        }
-    }
-    None
+    // Only the browser in front, asked by its own bundle id with a bounded wait. The old scripts told "Google Chrome"
+    // then "Safari" by name: that launched Chrome when it was not running, read Chrome's tab while Safari was in front,
+    // and waited without limit while macOS showed its Automation prompt.
+    let front = crate::macos_foreground::front_app()?;
+    crate::screen_context::mac_front_browser_url(front.bundle_id.as_deref()?)
 }
 
 // ─── Linux: xdotool + xclip ──────────────────────────────────────────
