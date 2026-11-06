@@ -994,6 +994,18 @@ pub fn run() {
                 });
             }
 
+            // macOS: let Vision build its text model in the background. The first recognition after install (and after
+            // each macOS update) takes about 23 s; warmed, the first "what's on my screen" read takes ~90 ms (measured).
+            // Later starts find the model cached and this costs ~50 ms. Delayed so it never competes with boot.
+            #[cfg(target_os = "macos")]
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                crate::focus_mode::wait_until_clear("ocr_warm_up").await;
+                if let Ok(took) = tokio::task::spawn_blocking(crate::ocr::warm_up).await {
+                    tracing::info!("ocr: Vision warm-up done in {} ms", took.as_millis());
+                }
+            });
+
             // STT pre-warm removed in Phase 2.
             // Primary STT is now Groq cloud (0 MB RAM, ~247ms latency).
             // Local faster-whisper starts lazily only as a fallback when

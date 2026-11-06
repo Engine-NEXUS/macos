@@ -60,6 +60,17 @@ pub fn capture_screen_text_only() -> Option<String> {
     capture_region_text_rects(0, 0, mw, mh).map(|(t, _)| t)
 }
 
+/// Run one recognition on a small blank image so Vision builds its model now, off the voice path. The first
+/// recognition for a new process name (after install, and again after each macOS update) compiles the model into
+/// `~/Library/Caches/<process>/com.apple.e5rt.e5bundlecache` and takes about 24 s; a later "what's on my screen" then
+/// answers in tens of milliseconds. Returns how long it took.
+pub fn warm_up() -> std::time::Duration {
+    let t0 = std::time::Instant::now();
+    let blank = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(256, 64, image::Rgba([255, 255, 255, 255])));
+    let _ = recognize_image(&blank);
+    t0.elapsed()
+}
+
 /// Vision text recognition on one image: every recognized line's best candidate with its normalized box, in Vision's
 /// order. None when Vision is missing or the request fails (logged); Some(empty) when the image holds no text.
 fn recognize_image(img: &image::DynamicImage) -> Option<Vec<(String, NormBox)>> {
@@ -556,6 +567,21 @@ mod tests {
     /// Retina capture. Ignored by default: CI runs on macOS VMs, where Vision's text models are unverified, and the
     /// first run of each new test binary spends ~24 s compiling them. Run with
     /// `cargo test --lib ocr -- --ignored --nocapture`.
+    /// The blank-image warm-up must be what pays the model build, so the first real read is fast. Meaningful only with a
+    /// cold cache: copy the test binary to a new name first (the cache is keyed by process name).
+    #[test]
+    #[ignore = "real Vision run; meaningful only from a freshly named test binary (cold model cache)"]
+    fn warm_up_pays_the_model_build_so_the_first_read_is_fast() {
+        let warm = super::warm_up();
+        let img = render_text(1200, 400, 56.0, 60.0, &[("NEXUS reads the screen", 100.0)]);
+        let started = std::time::Instant::now();
+        let raw = recognize_image(&img).expect("Vision request failed");
+        let read = started.elapsed();
+        println!("warm-up {} ms, then first real read {} ms: {raw:?}", warm.as_millis(), read.as_millis());
+        assert!(raw.iter().any(|(t, _)| t.contains("NEXUS")));
+        assert!(read < std::time::Duration::from_secs(2), "the real read still paid the model build: {read:?}");
+    }
+
     #[test]
     #[ignore = "real Vision run: unverified on CI macOS VMs; first run per binary compiles the models (~24 s)"]
     fn vision_reads_rendered_text_with_boxes_in_points() {
