@@ -3101,6 +3101,13 @@ pub fn set_autostart<R: Runtime>(
     #[cfg(not(target_os = "windows"))]
     {
         let autostart = app.autolaunch();
+        #[cfg(target_os = "macos")]
+        if enabled {
+            let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            if !crate::boot::runs_from_app_bundle(&exe) {
+                return Err("Start at login works only from the installed NEXUS app, not a development build.".into());
+            }
+        }
         if enabled {
             autostart.enable().map_err(|e| e.to_string())?;
             tracing::info!("autostart: enabled (LaunchAgent)");

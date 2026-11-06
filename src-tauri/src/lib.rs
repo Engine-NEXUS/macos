@@ -720,9 +720,39 @@ pub fn run() {
                 }
             }
 
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "macos")]
             {
-                // macOS/Linux: use tauri-plugin-autostart (LaunchAgent / systemd)
+                // LaunchAgent via tauri-plugin-autostart, registered only from the installed .app (boot::runs_from_app_bundle).
+                let autostart = app.autolaunch();
+                let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                if !crate::boot::runs_from_app_bundle(&exe) {
+                    // A development build: never a login item. Remove one an earlier dev run left behind, but keep the
+                    // installed app's own entry (same label) untouched.
+                    let agent = std::env::var("HOME").map(|h| {
+                        std::path::Path::new(&h).join("Library/LaunchAgents").join(format!("{}.plist", app.package_info().name))
+                    });
+                    let stale = agent
+                        .ok()
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .is_some_and(|plist| !crate::boot::runs_from_app_bundle(&plist));
+                    if stale {
+                        let _ = autostart.disable();
+                        tracing::info!("autostart: removed a login item that pointed at a development build");
+                    } else {
+                        tracing::info!("autostart: skipped (development build, not an installed .app)");
+                    }
+                } else if autostart_enabled {
+                    let _ = autostart.enable();
+                    tracing::info!("autostart: enabled (LaunchAgent)");
+                } else {
+                    let _ = autostart.disable();
+                    tracing::info!("autostart: disabled");
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                // Linux: use tauri-plugin-autostart (systemd / XDG autostart)
                 let autostart = app.autolaunch();
                 if autostart_enabled {
                     let _ = autostart.enable();

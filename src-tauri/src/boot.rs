@@ -74,6 +74,13 @@ pub fn needs_profile_reset(recorded_mode: Option<&str>, current_mode: &str) -> b
     recorded_mode.map(str::trim) != Some(current_mode)
 }
 
+/// True when the executable is the one inside an installed `.app` bundle (`NEXUS.app/Contents/MacOS/nexus`).
+/// A macOS login item must only point there: a dev build in `src-tauri/target/` registered as a LaunchAgent starts a
+/// stale binary at every login and asks for the Keychain password each time it is rebuilt.
+pub fn runs_from_app_bundle(exe: &str) -> bool {
+    exe.contains(".app/Contents/MacOS/")
+}
+
 // ---- Persisted boot timeline ----
 
 fn data_dir() -> Option<PathBuf> {
@@ -180,6 +187,15 @@ mod tests {
         assert!(needs_profile_reset(Some("release"), "dev"));
         assert!(needs_profile_reset(None, "release"));
         assert!(needs_profile_reset(Some(""), "release"));
+    }
+
+    #[test]
+    fn only_an_installed_app_bundle_counts_as_installed() {
+        assert!(runs_from_app_bundle("/Applications/NEXUS.app/Contents/MacOS/nexus"));
+        assert!(runs_from_app_bundle("/Users/me/Applications/NEXUS.app/Contents/MacOS/nexus"));
+        assert!(!runs_from_app_bundle("/Users/me/NEXUS/macos/src-tauri/target/debug/nexus"));
+        assert!(!runs_from_app_bundle("/Users/me/NEXUS/macos/src-tauri/target/release/nexus"));
+        assert!(!runs_from_app_bundle(""));
     }
 
     #[test]
